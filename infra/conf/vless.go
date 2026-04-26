@@ -29,12 +29,23 @@ type VLessInboundFallback struct {
 	Xver uint64          `json:"xver"`
 }
 
+// VLessInboundVirtualNetwork mirrors proto VirtualNetwork for JSON parsing.
+// Use a pointer to *bool for PersistMapping so absence is distinguishable
+// from an explicit false — this lets the handler default it to true when
+// unset.
+type VLessInboundVirtualNetwork struct {
+	Enabled        bool   `json:"enabled"`
+	Subnet         string `json:"subnet"`
+	PersistMapping *bool  `json:"persistMapping"`
+}
+
 type VLessInboundConfig struct {
-	Clients    []json.RawMessage       `json:"clients"`
-	Decryption string                  `json:"decryption"`
-	Fallbacks  []*VLessInboundFallback `json:"fallbacks"`
-	Flow       string                  `json:"flow"`
-	Testseed   []uint32                `json:"testseed"`
+	Clients        []json.RawMessage           `json:"clients"`
+	Decryption     string                      `json:"decryption"`
+	Fallbacks      []*VLessInboundFallback     `json:"fallbacks"`
+	Flow           string                      `json:"flow"`
+	Testseed       []uint32                    `json:"testseed"`
+	VirtualNetwork *VLessInboundVirtualNetwork `json:"virtualNetwork"`
 }
 
 // Build implements Buildable
@@ -197,6 +208,21 @@ func (c *VLessInboundConfig) Build() (proto.Message, error) {
 		if fb.Xver > 2 {
 			return nil, errors.New(`VLESS fallbacks: invalid PROXY protocol version, "xver" only accepts 0, 1, 2`)
 		}
+	}
+
+	if c.VirtualNetwork != nil {
+		vn := &inbound.VirtualNetwork{
+			Enabled: c.VirtualNetwork.Enabled,
+			Subnet:  c.VirtualNetwork.Subnet,
+		}
+		if c.VirtualNetwork.PersistMapping != nil {
+			vn.PersistMapping = *c.VirtualNetwork.PersistMapping
+		} else {
+			// Unset in JSON: default to true. This matches the task
+			// which implies persistence is the expected behaviour.
+			vn.PersistMapping = true
+		}
+		config.VirtualNetwork = vn
 	}
 
 	return config, nil
