@@ -6,6 +6,7 @@ import (
 	gotls "crypto/tls"
 	"encoding/base64"
 	"io"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/mux"
@@ -26,6 +28,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/dns"
@@ -39,6 +42,7 @@ import (
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
 	"github.com/xtls/xray-core/proxy/vless/encryption"
+	"github.com/xtls/xray-core/proxy/vless/virtualnet"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -85,6 +89,11 @@ type Handler struct {
 	ctx                    context.Context
 	fallbacks              map[string]map[string]map[string]*Fallback // or nil
 	// regexps               map[string]*regexp.Regexp       // or nil
+
+	// vnet is the optional virtual L3 network switch. It is non-nil
+	// only when the inbound config sets virtualNetwork.enabled=true.
+	// When nil all code paths behave exactly as vanilla VLESS.
+	vnet *virtualnet.Switch
 }
 
 // New creates a new VLess inbound handler.
@@ -174,7 +183,106 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 		}
 	}
 
+	if vn := config.GetVirtualNetwork(); vn.GetEnabled() {
+		if err := handler.initVirtualNetwork(vn); err != nil {
+			return nil, errors.New("failed to init virtualNetwork").Base(err).AtError()
+		}
+	}
+
 	return handler, nil
+}
+
+// initVirtualNetwork builds the handler's *virtualnet.Switch from its
+// protobuf-level configuration. The switch owns its own gVisor userspace
+// stack; TCP/UDP flows terminated by that stack are forwarded to
+// handler.defaultDispatcher with the originating user's virtual IP as
+// the inbound source so that xray routing rules can key on sourceIP.
+func (h *Handler) initVirtualNetwork(cfg *VirtualNetwork) error {
+	subnetStr := cfg.GetSubnet()
+	if subnetStr == "" {
+		// Default matches the task's example config.
+		subnetStr = "10.0.0.0/24"
+	}
+	prefix, err := netip.ParsePrefix(subnetStr)
+	if err != nil {
+		return errors.New("invalid subnet " + subnetStr).Base(err)
+	}
+
+	sw, err := virtualnet.NewSwitch(h.ctx, virtualnet.Config{
+		Subnet:         prefix,
+		PersistMapping: cfg.GetPersistMapping(),
+		Handler:        h.virtualNetworkConnHandler(),
+	})
+	if err != nil {
+		return err
+	}
+	h.vnet = sw
+	return nil
+}
+
+// virtualNetworkConnHandler builds the ConnHandler closure passed into
+// virtualnet.Switch. It is invoked for every TCP/UDP flow that reaches
+// the virtual gateway and needs to be forwarded out via xray.
+//
+// The flow's source IP (the originating user's virtual IP) becomes the
+// xray session.Inbound.Source, which is what rules like
+// {"sourceIP": "10.0.0.2"} match on.
+func (h *Handler) virtualNetworkConnHandler() virtualnet.ConnHandler {
+	return func(srcVirtIP netip.Addr, dst net.Destination, conn net.Conn) {
+		if h.defaultDispatcher == nil {
+			_ = conn.Close()
+			return
+		}
+		ctx, cancel := context.WithCancel(core.ToBackgroundDetachedContext(h.ctx))
+		defer cancel()
+		ctx = c.ContextWithID(ctx, session.NewID())
+
+		inbound := &session.Inbound{
+			Name:   "vless",
+			Source: net.DestinationFromAddr(conn.RemoteAddr()),
+			// Gateway / Tag are filled in by xray proxyman before
+			// Process is called normally; for synthesised sub-flows we
+			// don't know the inbound tag here so callers that key
+			// rules on inboundTag should rely on the original VLESS
+			// inbound tag via routing's context propagation. Setting
+			// Source to the virtual IP is the critical bit for the
+			// per-user sourceIP rules in the task.
+		}
+		// Overwrite Source with the user's virtual IP so that routing
+		// rules referencing sourceIP match the virtual network
+		// address instead of the underlying transport endpoint.
+		inbound.Source = net.Destination{
+			Network: dst.Network,
+			Address: net.IPAddress(srcVirtIP.AsSlice()),
+			Port:    0,
+		}
+		// If the IPAM knows which user owns this IP, attach the
+		// MemoryUser so user-targeted rules (email, level) still work.
+		if uuidStr, ok := h.vnet.IPAM().UUIDOf(srcVirtIP); ok {
+			if parsed, perr := uuid.ParseString(uuidStr); perr == nil {
+				if u := h.validator.Get(parsed); u != nil {
+					inbound.User = u
+				}
+			}
+		}
+		ctx = session.ContextWithInbound(ctx, inbound)
+		ctx = session.ContextWithContent(ctx, &session.Content{})
+
+		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+			From:   inbound.Source,
+			To:     dst,
+			Status: log.AccessAccepted,
+			Reason: "virtualnet",
+		})
+
+		if err := h.defaultDispatcher.DispatchLink(ctx, dst, &transport.Link{
+			Reader: buf.NewReader(conn),
+			Writer: buf.NewWriter(conn),
+		}); err != nil {
+			errors.LogInfoInner(ctx, err, "virtualnet dispatch ends")
+		}
+		_ = conn.Close()
+	}
 }
 
 func isMuxAndNotXUDP(request *protocol.RequestHeader, first *buf.Buffer) bool {
@@ -232,6 +340,9 @@ func (h *Handler) Close() error {
 	}
 	for _, u := range h.validator.GetAll() {
 		h.RemoveReverse(u)
+	}
+	if h.vnet != nil {
+		_ = h.vnet.Close()
 	}
 	return errors.Combine(common.Close(h.validator))
 }
@@ -630,12 +741,91 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return r.NewMux(ctx, dispatcher.WrapLink(ctx, h.policyManager, h.stats, &transport.Link{Reader: clientReader, Writer: clientWriter}), h.observer)
 	}
 
+	// Virtual network branch. When the inbound was configured with
+	// virtualNetwork.enabled=true, every authenticated VLESS connection
+	// on this inbound is treated as an L3 tunnel: the stream carries
+	// length-prefixed raw IPv4 packets after the VLESS response header.
+	// See proxy/vless/virtualnet for the protocol details.
+	//
+	// This branch only runs when h.vnet != nil. With h.vnet == nil
+	// (vanilla VLESS) the control falls through to the legacy
+	// DispatchLink path, preserving existing behaviour.
+	if h.vnet != nil {
+		// We require flow="" for the virtual network because XTLS
+		// Vision splices raw TCP — incompatible with our framing.
+		if requestAddons.Flow != "" {
+			return errors.New("virtualNetwork: unsupported flow " + requestAddons.Flow).AtWarning()
+		}
+		if request.Command != protocol.RequestCommandTCP {
+			return errors.New("virtualNetwork: only TCP command is supported").AtWarning()
+		}
+		return h.serveVirtualNetwork(ctx, account, clientReader, clientWriter, connection)
+	}
+
 	if err := dispatch.DispatchLink(ctx, request.Destination(), &transport.Link{
 		Reader: clientReader,
 		Writer: clientWriter},
 	); err != nil {
 		return errors.New("failed to dispatch request").Base(err)
 	}
+	return nil
+}
+
+// serveVirtualNetwork turns the VLESS post-handshake stream into an L3
+// tunnel: the user is assigned (or reuses) a virtual IP, their stream is
+// registered with the switch, and this function blocks until the stream
+// closes or the switch is torn down.
+//
+// The VLESS response header was already written by the caller via
+// bufferWriter, so clientReader/clientWriter carry only body bytes from
+// this point on; they are packaged up as an io.ReadWriteCloser for the
+// switch via virtualnet.StreamConn.
+func (h *Handler) serveVirtualNetwork(
+	ctx context.Context,
+	account *vless.MemoryAccount,
+	clientReader buf.Reader,
+	clientWriter buf.Writer,
+	connection stat.Connection,
+) error {
+	ip, err := h.vnet.IPAM().Assign(account.ID.String())
+	if err != nil {
+		return errors.New("virtualNetwork: assign IP").Base(err)
+	}
+
+	// Rewrite the session.Inbound.Source so xray routing rules that key
+	// on sourceIP (e.g. "10.0.0.2") match against the user's virtual IP
+	// for the lifetime of this connection. This is the "Virtual IPs
+	// must appear as source IP in xray's routing context" requirement.
+	inbound := session.InboundFromContext(ctx)
+	if inbound != nil {
+		inbound.Source = net.Destination{
+			Network: net.Network_TCP,
+			Address: net.IPAddress(ip.AsSlice()),
+			Port:    0,
+		}
+	}
+
+	stream := virtualnet.NewStreamConn(clientReader, clientWriter, connection)
+	ep, err := h.vnet.Register(ip, account.ID.String(), stream)
+	if err != nil {
+		return errors.New("virtualNetwork: register").Base(err)
+	}
+	errors.LogInfo(ctx, "virtualNetwork: user "+account.ID.String()+" connected as "+ip.String())
+
+	// Block until the endpoint's read loop exits or the outer ctx is
+	// cancelled (the VLESS connection handler cancels ctx on client
+	// disconnect).
+	done := make(chan struct{})
+	go func() {
+		ep.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		_ = ep.Close()
+	}
+	errors.LogInfo(ctx, "virtualNetwork: user "+account.ID.String()+" disconnected from "+ip.String())
 	return nil
 }
 

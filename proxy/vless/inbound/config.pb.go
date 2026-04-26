@@ -106,22 +106,89 @@ func (x *Fallback) GetXver() uint64 {
 	return 0
 }
 
+type VirtualNetwork struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Enable L3 virtual networking for this inbound. When false (or the
+	// message is absent) the inbound behaves identically to vanilla VLESS.
+	Enabled bool `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	// Subnet in CIDR form. Default: 10.0.0.0/24. The first host is used
+	// as the gateway bound to the server's gVisor stack.
+	Subnet string `protobuf:"bytes,2,opt,name=subnet,proto3" json:"subnet,omitempty"`
+	// Keep UUID -> IP assignments even after a user disconnects, so the
+	// same user gets the same IP when they return. Defaults to true.
+	PersistMapping bool `protobuf:"varint,3,opt,name=persist_mapping,json=persistMapping,proto3" json:"persist_mapping,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *VirtualNetwork) Reset() {
+	*x = VirtualNetwork{}
+	mi := &file_proxy_vless_inbound_config_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VirtualNetwork) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VirtualNetwork) ProtoMessage() {}
+
+func (x *VirtualNetwork) ProtoReflect() protoreflect.Message {
+	mi := &file_proxy_vless_inbound_config_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VirtualNetwork.ProtoReflect.Descriptor instead.
+func (*VirtualNetwork) Descriptor() ([]byte, []int) {
+	return file_proxy_vless_inbound_config_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *VirtualNetwork) GetEnabled() bool {
+	if x != nil {
+		return x.Enabled
+	}
+	return false
+}
+
+func (x *VirtualNetwork) GetSubnet() string {
+	if x != nil {
+		return x.Subnet
+	}
+	return ""
+}
+
+func (x *VirtualNetwork) GetPersistMapping() bool {
+	if x != nil {
+		return x.PersistMapping
+	}
+	return false
+}
+
 type Config struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Clients       []*protocol.User       `protobuf:"bytes,1,rep,name=clients,proto3" json:"clients,omitempty"`
-	Fallbacks     []*Fallback            `protobuf:"bytes,2,rep,name=fallbacks,proto3" json:"fallbacks,omitempty"`
-	Decryption    string                 `protobuf:"bytes,3,opt,name=decryption,proto3" json:"decryption,omitempty"`
-	XorMode       uint32                 `protobuf:"varint,4,opt,name=xorMode,proto3" json:"xorMode,omitempty"`
-	SecondsFrom   int64                  `protobuf:"varint,5,opt,name=seconds_from,json=secondsFrom,proto3" json:"seconds_from,omitempty"`
-	SecondsTo     int64                  `protobuf:"varint,6,opt,name=seconds_to,json=secondsTo,proto3" json:"seconds_to,omitempty"`
-	Padding       string                 `protobuf:"bytes,7,opt,name=padding,proto3" json:"padding,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Clients        []*protocol.User       `protobuf:"bytes,1,rep,name=clients,proto3" json:"clients,omitempty"`
+	Fallbacks      []*Fallback            `protobuf:"bytes,2,rep,name=fallbacks,proto3" json:"fallbacks,omitempty"`
+	Decryption     string                 `protobuf:"bytes,3,opt,name=decryption,proto3" json:"decryption,omitempty"`
+	XorMode        uint32                 `protobuf:"varint,4,opt,name=xorMode,proto3" json:"xorMode,omitempty"`
+	SecondsFrom    int64                  `protobuf:"varint,5,opt,name=seconds_from,json=secondsFrom,proto3" json:"seconds_from,omitempty"`
+	SecondsTo      int64                  `protobuf:"varint,6,opt,name=seconds_to,json=secondsTo,proto3" json:"seconds_to,omitempty"`
+	Padding        string                 `protobuf:"bytes,7,opt,name=padding,proto3" json:"padding,omitempty"`
+	VirtualNetwork *VirtualNetwork        `protobuf:"bytes,8,opt,name=virtual_network,json=virtualNetwork,proto3" json:"virtual_network,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Config) Reset() {
 	*x = Config{}
-	mi := &file_proxy_vless_inbound_config_proto_msgTypes[1]
+	mi := &file_proxy_vless_inbound_config_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -133,7 +200,7 @@ func (x *Config) String() string {
 func (*Config) ProtoMessage() {}
 
 func (x *Config) ProtoReflect() protoreflect.Message {
-	mi := &file_proxy_vless_inbound_config_proto_msgTypes[1]
+	mi := &file_proxy_vless_inbound_config_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -146,7 +213,7 @@ func (x *Config) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Config.ProtoReflect.Descriptor instead.
 func (*Config) Descriptor() ([]byte, []int) {
-	return file_proxy_vless_inbound_config_proto_rawDescGZIP(), []int{1}
+	return file_proxy_vless_inbound_config_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Config) GetClients() []*protocol.User {
@@ -198,6 +265,13 @@ func (x *Config) GetPadding() string {
 	return ""
 }
 
+func (x *Config) GetVirtualNetwork() *VirtualNetwork {
+	if x != nil {
+		return x.VirtualNetwork
+	}
+	return nil
+}
+
 var File_proxy_vless_inbound_config_proto protoreflect.FileDescriptor
 
 const file_proxy_vless_inbound_config_proto_rawDesc = "" +
@@ -209,7 +283,11 @@ const file_proxy_vless_inbound_config_proto_rawDesc = "" +
 	"\x04path\x18\x03 \x01(\tR\x04path\x12\x12\n" +
 	"\x04type\x18\x04 \x01(\tR\x04type\x12\x12\n" +
 	"\x04dest\x18\x05 \x01(\tR\x04dest\x12\x12\n" +
-	"\x04xver\x18\x06 \x01(\x04R\x04xver\"\x96\x02\n" +
+	"\x04xver\x18\x06 \x01(\x04R\x04xver\"k\n" +
+	"\x0eVirtualNetwork\x12\x18\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\x12\x16\n" +
+	"\x06subnet\x18\x02 \x01(\tR\x06subnet\x12'\n" +
+	"\x0fpersist_mapping\x18\x03 \x01(\bR\x0epersistMapping\"\xe9\x02\n" +
 	"\x06Config\x124\n" +
 	"\aclients\x18\x01 \x03(\v2\x1a.xray.common.protocol.UserR\aclients\x12@\n" +
 	"\tfallbacks\x18\x02 \x03(\v2\".xray.proxy.vless.inbound.FallbackR\tfallbacks\x12\x1e\n" +
@@ -220,7 +298,8 @@ const file_proxy_vless_inbound_config_proto_rawDesc = "" +
 	"\fseconds_from\x18\x05 \x01(\x03R\vsecondsFrom\x12\x1d\n" +
 	"\n" +
 	"seconds_to\x18\x06 \x01(\x03R\tsecondsTo\x12\x18\n" +
-	"\apadding\x18\a \x01(\tR\apaddingBj\n" +
+	"\apadding\x18\a \x01(\tR\apadding\x12Q\n" +
+	"\x0fvirtual_network\x18\b \x01(\v2(.xray.proxy.vless.inbound.VirtualNetworkR\x0evirtualNetworkBj\n" +
 	"\x1ccom.xray.proxy.vless.inboundP\x01Z-github.com/xtls/xray-core/proxy/vless/inbound\xaa\x02\x18Xray.Proxy.Vless.Inboundb\x06proto3"
 
 var (
@@ -235,20 +314,22 @@ func file_proxy_vless_inbound_config_proto_rawDescGZIP() []byte {
 	return file_proxy_vless_inbound_config_proto_rawDescData
 }
 
-var file_proxy_vless_inbound_config_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_proxy_vless_inbound_config_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_proxy_vless_inbound_config_proto_goTypes = []any{
-	(*Fallback)(nil),      // 0: xray.proxy.vless.inbound.Fallback
-	(*Config)(nil),        // 1: xray.proxy.vless.inbound.Config
-	(*protocol.User)(nil), // 2: xray.common.protocol.User
+	(*Fallback)(nil),       // 0: xray.proxy.vless.inbound.Fallback
+	(*VirtualNetwork)(nil), // 1: xray.proxy.vless.inbound.VirtualNetwork
+	(*Config)(nil),         // 2: xray.proxy.vless.inbound.Config
+	(*protocol.User)(nil),  // 3: xray.common.protocol.User
 }
 var file_proxy_vless_inbound_config_proto_depIdxs = []int32{
-	2, // 0: xray.proxy.vless.inbound.Config.clients:type_name -> xray.common.protocol.User
+	3, // 0: xray.proxy.vless.inbound.Config.clients:type_name -> xray.common.protocol.User
 	0, // 1: xray.proxy.vless.inbound.Config.fallbacks:type_name -> xray.proxy.vless.inbound.Fallback
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	1, // 2: xray.proxy.vless.inbound.Config.virtual_network:type_name -> xray.proxy.vless.inbound.VirtualNetwork
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_proxy_vless_inbound_config_proto_init() }
@@ -262,7 +343,7 @@ func file_proxy_vless_inbound_config_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_vless_inbound_config_proto_rawDesc), len(file_proxy_vless_inbound_config_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

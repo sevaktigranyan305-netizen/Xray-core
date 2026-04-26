@@ -17,6 +17,18 @@ message Fallback {
   uint64 xver = 6;
 }
 
+message VirtualNetwork {
+  // Enable L3 virtual networking for this inbound. When false (or the
+  // message is absent) the inbound behaves identically to vanilla VLESS.
+  bool enabled = 1;
+  // Subnet in CIDR form. Default: 10.0.0.0/24. The first host is used
+  // as the gateway bound to the server's gVisor stack.
+  string subnet = 2;
+  // Keep UUID -> IP assignments even after a user disconnects, so the
+  // same user gets the same IP when they return. Defaults to true.
+  bool persist_mapping = 3;
+}
+
 message Config {
   repeated xray.common.protocol.User clients = 1;
   repeated Fallback fallbacks = 2;
@@ -26,4 +38,6 @@ message Config {
   int64 seconds_from = 5;
   int64 seconds_to = 6;
   string padding = 7;
+
+  VirtualNetwork virtual_network = 8;
 }
