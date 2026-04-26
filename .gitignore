@@ -2,6 +2,7 @@
 *.exe
 *.exe~
 *.dll
+!resources/wintun/**/*.dll
 *.so
 *.dylib
 
@@ -36,6 +37,7 @@ vprotogen
 errorgen
 !common/errors/errorgen/
 *.dat
+!resources/*.dat
 
 # Build assets
 /build_assets/
