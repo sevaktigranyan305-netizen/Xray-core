@@ -264,6 +264,7 @@ type VLessOutboundVirtualNetwork struct {
 	Subnet        string `json:"subnet"`
 	InterfaceName string `json:"interfaceName"`
 	MTU           int32  `json:"mtu"`
+	DefaultRoute  bool   `json:"defaultRoute"`
 }
 
 type VLessOutboundConfig struct {
@@ -413,6 +414,7 @@ func (c *VLessOutboundConfig) Build() (proto.Message, error) {
 			Subnet:        c.VirtualNetwork.Subnet,
 			InterfaceName: c.VirtualNetwork.InterfaceName,
 			Mtu:           c.VirtualNetwork.MTU,
+			DefaultRoute:  c.VirtualNetwork.DefaultRoute,
 		}
 	}
 

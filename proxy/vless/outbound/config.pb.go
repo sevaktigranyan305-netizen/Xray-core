@@ -38,7 +38,13 @@ type VirtualNetwork struct {
 	// darwin (utunN is kernel-assigned). Optional; defaults to "xray0".
 	InterfaceName string `protobuf:"bytes,3,opt,name=interface_name,json=interfaceName,proto3" json:"interface_name,omitempty"`
 	// MTU is the TUN interface MTU. 0 means use the package default.
-	Mtu           int32 `protobuf:"varint,4,opt,name=mtu,proto3" json:"mtu,omitempty"`
+	Mtu int32 `protobuf:"varint,4,opt,name=mtu,proto3" json:"mtu,omitempty"`
+	// DefaultRoute, when true, hijacks 0.0.0.0/0 through the TUN so all
+	// internet traffic from this host is tunnelled to the VLESS server.
+	// The server's real IP is automatically excluded via the underlay
+	// gateway to avoid a routing loop. When false (default), only the
+	// virtual subnet is routed through the TUN.
+	DefaultRoute  bool `protobuf:"varint,5,opt,name=default_route,json=defaultRoute,proto3" json:"default_route,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -101,6 +107,13 @@ func (x *VirtualNetwork) GetMtu() int32 {
 	return 0
 }
 
+func (x *VirtualNetwork) GetDefaultRoute() bool {
+	if x != nil {
+		return x.DefaultRoute
+	}
+	return false
+}
+
 type Config struct {
 	state          protoimpl.MessageState   `protogen:"open.v1"`
 	Vnext          *protocol.ServerEndpoint `protobuf:"bytes,1,opt,name=vnext,proto3" json:"vnext,omitempty"`
@@ -157,12 +170,13 @@ var File_proxy_vless_outbound_config_proto protoreflect.FileDescriptor
 
 const file_proxy_vless_outbound_config_proto_rawDesc = "" +
 	"\n" +
-	"!proxy/vless/outbound/config.proto\x12\x19xray.proxy.vless.outbound\x1a!common/protocol/server_spec.proto\"{\n" +
+	"!proxy/vless/outbound/config.proto\x12\x19xray.proxy.vless.outbound\x1a!common/protocol/server_spec.proto\"\xa0\x01\n" +
 	"\x0eVirtualNetwork\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12\x16\n" +
 	"\x06subnet\x18\x02 \x01(\tR\x06subnet\x12%\n" +
 	"\x0einterface_name\x18\x03 \x01(\tR\rinterfaceName\x12\x10\n" +
-	"\x03mtu\x18\x04 \x01(\x05R\x03mtu\"\x98\x01\n" +
+	"\x03mtu\x18\x04 \x01(\x05R\x03mtu\x12#\n" +
+	"\rdefault_route\x18\x05 \x01(\bR\fdefaultRoute\"\x98\x01\n" +
 	"\x06Config\x12:\n" +
 	"\x05vnext\x18\x01 \x01(\v2$.xray.common.protocol.ServerEndpointR\x05vnext\x12R\n" +
 	"\x0fvirtual_network\x18\x02 \x01(\v2).xray.proxy.vless.outbound.VirtualNetworkR\x0evirtualNetworkBm\n" +

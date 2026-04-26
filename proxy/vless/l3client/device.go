@@ -88,10 +88,16 @@ type deviceConfig struct {
 	// MTU is the interface MTU. 0 means use the package default.
 	MTU int
 
-	// ServerIP, if set, is an IPv4 address the client should explicitly
-	// exclude from the default-route hijack so packets toward the VLESS
-	// server keep using the host's underlay route instead of looping
-	// through the TUN. Callers that don't install a default route can
-	// leave this as the zero value.
+	// ServerIP, if set, is the real IPv4 of the VLESS server. It is
+	// used only when DefaultRoute is true, to install a /32 host route
+	// for the server via the underlay gateway (so packets toward the
+	// server keep using the host's original route instead of being
+	// reflected through the TUN).
 	ServerIP netip.Addr
+
+	// DefaultRoute, when true, installs 0.0.0.0/0 through the TUN
+	// interface (as two /1 routes to avoid disturbing the underlying
+	// real default route). When false, only the intra-tunnel subnet
+	// route is installed.
+	DefaultRoute bool
 }

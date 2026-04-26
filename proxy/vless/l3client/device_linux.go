@@ -110,7 +110,100 @@ func newDevice(cfg deviceConfig) (Device, error) {
 	}
 	d.routes = append(d.routes, subnetRoute)
 
+	if cfg.DefaultRoute {
+		if err := d.installDefaultRoute(cfg.ServerIP); err != nil {
+			_ = d.Close()
+			return nil, err
+		}
+	}
+
 	return d, nil
+}
+
+// installDefaultRoute hijacks the host's default route through the TUN
+// using the WireGuard-classic pair-of-/1 trick: we add 0.0.0.0/1 and
+// 128.0.0.0/1 both pointing at the TUN. These are strictly more
+// specific than the existing default (0.0.0.0/0) so they take
+// precedence without having to delete or restore the real default.
+// Before installing them we add a /32 host route for the server via
+// the *pre-existing* default gateway so that VLESS packets to the
+// server keep following the underlay path and do not loop through the
+// TUN.
+//
+// The discovered underlay default is recorded on the device so Close()
+// can reverse all of this deterministically, even on panic.
+func (d *linuxDevice) installDefaultRoute(serverIP netip.Addr) error {
+	if !serverIP.Is4() {
+		return errors.New("l3client: default route requires an IPv4 server IP")
+	}
+
+	origGw, origLinkIndex, err := findDefaultRoute()
+	if err != nil {
+		return fmt.Errorf("l3client: discover default route: %w", err)
+	}
+
+	serverSlice := serverIP.As4()
+	serverHost := &netlink.Route{
+		LinkIndex: origLinkIndex,
+		Gw:        net.IP(origGw.AsSlice()),
+		Dst: &net.IPNet{
+			IP:   net.IP(serverSlice[:]),
+			Mask: net.CIDRMask(32, 32),
+		},
+	}
+	if err := netlink.RouteReplace(serverHost); err != nil {
+		return fmt.Errorf("l3client: RouteReplace server-host %s via %s: %w", serverIP, origGw, err)
+	}
+	d.routes = append(d.routes, serverHost)
+
+	for _, dst := range []*net.IPNet{
+		{IP: net.IPv4(0, 0, 0, 0), Mask: net.CIDRMask(1, 32)},
+		{IP: net.IPv4(128, 0, 0, 0), Mask: net.CIDRMask(1, 32)},
+	} {
+		r := &netlink.Route{
+			LinkIndex: d.link.Attrs().Index,
+			Scope:     netlink.SCOPE_LINK,
+			Dst:       dst,
+		}
+		if err := netlink.RouteReplace(r); err != nil {
+			return fmt.Errorf("l3client: RouteReplace default-half %s: %w", dst, err)
+		}
+		d.routes = append(d.routes, r)
+	}
+	return nil
+}
+
+// findDefaultRoute returns the gateway and interface index of the
+// currently-active IPv4 default route. If there is no default route
+// (e.g. inside a restricted network namespace) we return a clear error
+// so the caller can surface "you asked for default-route but there
+// is none to hijack" rather than silently installing an unreachable
+// TUN-only route.
+func findDefaultRoute() (netip.Addr, int, error) {
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return netip.Addr{}, 0, err
+	}
+	for _, r := range routes {
+		if r.Dst == nil && r.Gw != nil {
+			a, ok := netip.AddrFromSlice(r.Gw.To4())
+			if !ok {
+				continue
+			}
+			return a, r.LinkIndex, nil
+		}
+		if r.Dst != nil {
+			ones, bits := r.Dst.Mask.Size()
+			if ones == 0 && bits == 32 && r.Gw != nil {
+				a, ok := netip.AddrFromSlice(r.Gw.To4())
+				if !ok {
+					continue
+				}
+				return a, r.LinkIndex, nil
+			}
+		}
+	}
+	return netip.Addr{}, 0, errors.New("no IPv4 default route found")
 }
 
 func (d *linuxDevice) Name() string { return d.name }

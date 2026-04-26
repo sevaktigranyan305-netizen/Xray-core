@@ -266,7 +266,18 @@ func (h *Handler) virtualNetworkConnHandler() virtualnet.ConnHandler {
 			}
 		}
 		ctx = session.ContextWithInbound(ctx, inbound)
-		ctx = session.ContextWithContent(ctx, &session.Content{})
+		// Always enable HTTP+TLS sniffing for virtualnet sub-flows so
+		// server-side routing rules that key on domain (including
+		// geosite:*) behave the same as they would for a classic VLESS
+		// inbound with sniffing configured. MetadataOnly=false because
+		// we are already decrypting the TCP payload at the gVisor
+		// stack — inspecting the first bytes is free.
+		ctx = session.ContextWithContent(ctx, &session.Content{
+			SniffingRequest: session.SniffingRequest{
+				Enabled:                        true,
+				OverrideDestinationForProtocol: []string{"http", "tls"},
+			},
+		})
 
 		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 			From:   inbound.Source,
