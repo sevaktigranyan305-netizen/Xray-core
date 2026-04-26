@@ -36,6 +36,7 @@ vprotogen
 errorgen
 !common/errors/errorgen/
 *.dat
+!resources/*.dat
 
 # Build assets
 /build_assets/
