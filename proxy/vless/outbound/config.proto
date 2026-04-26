@@ -24,6 +24,12 @@ message VirtualNetwork {
   string interface_name = 3;
   // MTU is the TUN interface MTU. 0 means use the package default.
   int32 mtu = 4;
+  // DefaultRoute, when true, hijacks 0.0.0.0/0 through the TUN so all
+  // internet traffic from this host is tunnelled to the VLESS server.
+  // The server's real IP is automatically excluded via the underlay
+  // gateway to avoid a routing loop. When false (default), only the
+  // virtual subnet is routed through the TUN.
+  bool default_route = 5;
 }
 
 message Config {

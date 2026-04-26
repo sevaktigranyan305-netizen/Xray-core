@@ -164,6 +164,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 			Subnet:        subnet,
 			InterfaceName: vn.InterfaceName,
 			MTU:           int(vn.Mtu),
+			DefaultRoute:  vn.DefaultRoute,
 		})
 		if err != nil {
 			return nil, errors.New("virtualNetwork client").Base(err)
@@ -602,7 +603,26 @@ func (h *Handler) processL3(
 	_ = trafficState
 	_ = ob
 
-	return h.l3.client.Run(ctx, stream, timer)
+	// Extract the resolved server IP from the established conn so the
+	// device layer can install a /32 host-route exclusion before any
+	// default-route hijack. Domain names in vnext are resolved by the
+	// standard outbound dialer, so RemoteAddr is the actual IP we need.
+	// Both *net.TCPAddr (plain TCP, TLS, REALITY) and *net.UDPAddr
+	// (QUIC, splithttp/h3) are in scope since any VLESS stream
+	// transport could land here.
+	var serverIP netip.Addr
+	switch ra := conn.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		if a, ok := netip.AddrFromSlice(ra.IP); ok {
+			serverIP = a.Unmap()
+		}
+	case *net.UDPAddr:
+		if a, ok := netip.AddrFromSlice(ra.IP); ok {
+			serverIP = a.Unmap()
+		}
+	}
+
+	return h.l3.client.Run(ctx, stream, timer, serverIP)
 }
 
 // runL3Bootstrap is the keeper goroutine for virtualNetwork mode. It

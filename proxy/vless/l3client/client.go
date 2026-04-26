@@ -41,13 +41,12 @@ type Config struct {
 	// MTU constant). Most deployments should leave this at 0.
 	MTU int
 
-	// ServerIP, if set, is an IPv4 address the device layer will try to
-	// exclude from any default-route hijack so packets toward the VLESS
-	// server do not get reflected through the TUN and cause a loop.
-	// Today the device layer never installs a default route, so this
-	// is a forward-looking field; wiring it up only matters once
-	// "route everything via the tunnel" is added.
-	ServerIP netip.Addr
+	// DefaultRoute, when true, installs 0.0.0.0/0 (as two /1 routes to
+	// avoid deleting the real default) through the TUN. The server's
+	// real IP must be excluded via the underlay gateway, so Run needs
+	// the resolved serverIP to install a /32 exclusion. When false,
+	// only the intra-tunnel subnet is routed through the TUN.
+	DefaultRoute bool
 }
 
 // ActivityUpdater is the subset of common/signal.ActivityTimer we need.
@@ -78,7 +77,7 @@ func NewClient(cfg Config) (*Client, error) {
 // IP announcement, everything after is length-prefixed IPv4 frames.
 // The caller is responsible for closing stream; Run closes the TUN
 // device it creates.
-func (c *Client) Run(ctx context.Context, stream io.ReadWriteCloser, activity ActivityUpdater) error {
+func (c *Client) Run(ctx context.Context, stream io.ReadWriteCloser, activity ActivityUpdater, serverIP netip.Addr) error {
 	ip4, err := virtualnet.ReadIPPreamble(stream)
 	if err != nil {
 		return fmt.Errorf("l3client: read ip preamble: %w", err)
@@ -88,12 +87,19 @@ func (c *Client) Run(ctx context.Context, stream io.ReadWriteCloser, activity Ac
 		return fmt.Errorf("l3client: server announced %s outside subnet %s", ip, c.cfg.Subnet)
 	}
 
+	// The device layer uses serverIP to install a /32 host-route
+	// exclusion through the underlay gateway so that packets toward
+	// the VLESS server keep using the original route instead of being
+	// reflected back through the TUN. Unknown (zero) means "don't
+	// install a default route at all" — keeps backwards-compat for
+	// callers who only want the intra-tunnel subnet.
 	dev, err := newDevice(deviceConfig{
-		Name:     c.cfg.InterfaceName,
-		IP:       ip,
-		Subnet:   c.cfg.Subnet,
-		MTU:      c.cfg.MTU,
-		ServerIP: c.cfg.ServerIP,
+		Name:         c.cfg.InterfaceName,
+		IP:           ip,
+		Subnet:       c.cfg.Subnet,
+		MTU:          c.cfg.MTU,
+		ServerIP:     serverIP,
+		DefaultRoute: c.cfg.DefaultRoute,
 	})
 	if err != nil {
 		return err
