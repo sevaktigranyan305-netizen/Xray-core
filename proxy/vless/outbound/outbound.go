@@ -5,6 +5,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
+	"net/netip"
 	"reflect"
 	"strings"
 	"sync"
@@ -34,6 +35,8 @@ import (
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
 	"github.com/xtls/xray-core/proxy/vless/encryption"
+	"github.com/xtls/xray-core/proxy/vless/l3client"
+	"github.com/xtls/xray-core/proxy/vless/virtualnet"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -59,6 +62,24 @@ type Handler struct {
 	testpre  uint32
 	initpre  sync.Once
 	preConns chan *ConnExpire
+
+	// l3 holds state for the optional virtualNetwork L3-tunnel mode.
+	// Nil means virtualNetwork is disabled and this outbound behaves as
+	// a standard VLESS proxy; non-nil means every Process() call is
+	// repurposed into an L3 tunnel session. See runL3Bootstrap and the
+	// virtualnet/ package for the protocol.
+	l3 *l3State
+}
+
+// l3State groups the fields only used by virtualNetwork mode so the
+// default (nil) zero value keeps the Handler's hot path free of extra
+// branches. Populated in New() only if config.VirtualNetwork.Enabled.
+type l3State struct {
+	client    *l3client.Client
+	subnet    netip.Prefix
+	bootCtx   context.Context
+	cancelBoot context.CancelFunc
+	done      chan struct{}
 }
 
 type ConnExpire struct {
@@ -130,6 +151,38 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 	handler.testpre = a.Testpre
 
+	if vn := config.VirtualNetwork; vn != nil && vn.Enabled {
+		subnetStr := vn.Subnet
+		if subnetStr == "" {
+			subnetStr = "10.0.0.0/24"
+		}
+		subnet, err := netip.ParsePrefix(subnetStr)
+		if err != nil {
+			return nil, errors.New("invalid virtualNetwork.subnet: " + subnetStr).Base(err)
+		}
+		cli, err := l3client.NewClient(l3client.Config{
+			Subnet:        subnet,
+			InterfaceName: vn.InterfaceName,
+			MTU:           int(vn.Mtu),
+		})
+		if err != nil {
+			return nil, errors.New("virtualNetwork client").Base(err)
+		}
+		// ctx here already carries session.FullHandler (set by
+		// proxyman/outbound.NewHandler). We capture it for
+		// runL3Bootstrap which needs to synthesise per-attempt
+		// contexts that reference the same outer proxyman handler.
+		bootCtx, cancelBoot := context.WithCancel(ctx)
+		handler.l3 = &l3State{
+			client:     cli,
+			subnet:     subnet,
+			bootCtx:    bootCtx,
+			cancelBoot: cancelBoot,
+			done:       make(chan struct{}),
+		}
+		go handler.runL3Bootstrap()
+	}
+
 	return handler, nil
 }
 
@@ -137,6 +190,10 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 func (h *Handler) Close() error {
 	if h.preConns != nil {
 		close(h.preConns)
+	}
+	if h.l3 != nil {
+		h.l3.cancelBoot()
+		<-h.l3.done
 	}
 	if h.reverse != nil {
 		return h.reverse.Close()
@@ -318,6 +375,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		request.Port = net.Port(666)
 	}
 
+	// virtualNetwork mode: after the standard VLESS handshake, hand the
+	// post-handshake byte stream to the L3 client, which reads the
+	// assigned-IP preamble and runs the TUN<->stream packet loop. This
+	// branch bypasses the normal body-copy task.Run entirely; the
+	// link passed in by runL3Bootstrap is not used past this point.
+	if h.l3 != nil {
+		return h.processL3(ctx, conn, request, requestAddons, trafficState, ob, timer)
+	}
+
 	postRequest := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
@@ -486,4 +552,137 @@ func (r *Reverse) Start() error {
 
 func (r *Reverse) Close() error {
 	return r.monitorTask.Close()
+}
+
+// processL3 handles the virtualNetwork body path: encodes the VLESS
+// request header onto conn, decodes the response header, wraps the
+// post-handshake byte stream as an io.ReadWriteCloser, and runs the
+// l3client packet loop. It returns when the tunnel ends.
+//
+// The activity timer created by the caller is passed into the client
+// so each TUN read and stream read feeds Update(), preventing the
+// connection-idle cancel from firing on a busy tunnel.
+func (h *Handler) processL3(
+	ctx context.Context,
+	conn stat.Connection,
+	request *protocol.RequestHeader,
+	requestAddons *encoding.Addons,
+	trafficState *proxy.TrafficState,
+	ob *session.Outbound,
+	timer *signal.ActivityTimer,
+) error {
+	if request.Command != protocol.RequestCommandTCP || requestAddons.Flow != "" {
+		return errors.New("virtualNetwork: only flow=\"\" and command=TCP are supported")
+	}
+
+	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
+	if err := encoding.EncodeRequestHeader(bufferWriter, request, requestAddons); err != nil {
+		return errors.New("virtualNetwork: encode request header").Base(err).AtWarning()
+	}
+	// Flush the header onto the wire so the server can transition out
+	// of its header-reading state before we begin bidirectional I/O.
+	if err := bufferWriter.SetBuffered(false); err != nil {
+		return errors.New("virtualNetwork: flush request header").Base(err).AtWarning()
+	}
+
+	if _, err := encoding.DecodeResponseHeader(conn, request); err != nil {
+		return errors.New("virtualNetwork: decode response header").Base(err).AtInfo()
+	}
+
+	// Disable the inactivity-kill: the l3 client feeds Update() on
+	// every packet, so as long as the tunnel is carrying traffic the
+	// timer will not fire. This avoids reusing a tiny ConnectionIdle
+	// timeout (which is sized for a web-proxy request/response, not a
+	// long-lived VPN).
+	timer.SetTimeout(time.Hour * 24 * 365)
+
+	serverReader := buf.NewReader(conn)
+	serverWriter := buf.NewWriter(conn)
+	stream := virtualnet.NewStreamConn(serverReader, serverWriter, conn)
+	_ = trafficState
+	_ = ob
+
+	return h.l3.client.Run(ctx, stream, timer)
+}
+
+// runL3Bootstrap is the keeper goroutine for virtualNetwork mode. It
+// loops forever (until the handler is closed) dispatching into the
+// handler's own Process() via a synthetic link and a sentinel target.
+// On error it backs off with capped exponential delay.
+func (h *Handler) runL3Bootstrap() {
+	defer close(h.l3.done)
+
+	// Wait a short beat so the rest of core has finished initialising
+	// (outbound manager, dns, routing) before we try to dial. Mirrors
+	// the reverse-proxy bootstrap delay.
+	select {
+	case <-h.l3.bootCtx.Done():
+		return
+	case <-time.After(2 * time.Second):
+	}
+
+	backoff := time.Second
+	for {
+		if err := h.l3.bootCtx.Err(); err != nil {
+			return
+		}
+		started := time.Now()
+		err := h.l3Dial(h.l3.bootCtx)
+		if h.l3.bootCtx.Err() != nil {
+			return
+		}
+		if err != nil {
+			errors.LogWarningInner(h.l3.bootCtx, err, "virtualNetwork bootstrap attempt failed")
+		}
+		// If the tunnel stayed up for at least 30 seconds, reset the
+		// backoff; otherwise double it up to a minute.
+		if time.Since(started) > 30*time.Second {
+			backoff = time.Second
+		} else {
+			backoff *= 2
+			if backoff > time.Minute {
+				backoff = time.Minute
+			}
+		}
+		select {
+		case <-h.l3.bootCtx.Done():
+			return
+		case <-time.After(backoff):
+		}
+	}
+}
+
+// l3Dial performs a single virtualNetwork connection attempt. It wires
+// up a synthetic transport.Link (unused by processL3) and dispatches
+// through the handler's own Process so all the normal stream settings
+// (TLS/REALITY/transport) are applied by the outer proxyman handler.
+func (h *Handler) l3Dial(bootCtx context.Context) error {
+	fullHandler := session.FullHandlerFromContext(bootCtx)
+	if fullHandler == nil {
+		return errors.New("virtualNetwork: no FullHandler on bootstrap ctx")
+	}
+	pmHandler, ok := fullHandler.(internet.Dialer)
+	if !ok {
+		return errors.New("virtualNetwork: FullHandler does not implement internet.Dialer")
+	}
+
+	// Synthesise the outbound target. The server-side inbound ignores
+	// the target when its virtualNetwork is enabled, so any routable
+	// address works; we use the subnet gateway to make traces readable.
+	gateway := h.l3.subnet.Masked().Addr().Next()
+	outCtx := session.ContextWithOutbounds(bootCtx, []*session.Outbound{{
+		Target: net.Destination{
+			Network: net.Network_TCP,
+			Address: net.IPAddress(gateway.AsSlice()),
+			Port:    net.Port(1),
+		},
+	}})
+	outCtx = xctx.ContextWithID(outCtx, session.NewID())
+
+	reader, writer := pipe.New(pipe.WithSizeLimit(buf.Size))
+	link := &transport.Link{Reader: reader, Writer: writer}
+	defer common.Interrupt(reader)
+	defer common.Close(writer)
+
+	return h.Process(outCtx, link, pmHandler)
 }

@@ -806,6 +806,16 @@ func (h *Handler) serveVirtualNetwork(
 	}
 
 	stream := virtualnet.NewStreamConn(clientReader, clientWriter, connection)
+
+	// Announce the assigned virtual IP to the client as a one-shot
+	// 4-byte preamble before any framed traffic. The client's L3 mode
+	// state machine reads exactly PreambleSize bytes from the stream,
+	// assigns them to its TUN, and then enters framed-packet mode.
+	ip4 := ip.As4()
+	if err := virtualnet.WriteIPPreamble(stream, ip4); err != nil {
+		return errors.New("virtualNetwork: write IP preamble").Base(err)
+	}
+
 	ep, err := h.vnet.Register(ip, account.ID.String(), stream)
 	if err != nil {
 		return errors.New("virtualNetwork: register").Base(err)

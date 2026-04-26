@@ -256,19 +256,30 @@ type VLessOutboundVnext struct {
 	Users   []json.RawMessage `json:"users"`
 }
 
+// VLessOutboundVirtualNetwork mirrors outbound.VirtualNetwork proto for
+// JSON parsing of the optional L3 tunnel mode. All fields are optional;
+// enabling with defaults is just `"virtualNetwork": {"enabled": true}`.
+type VLessOutboundVirtualNetwork struct {
+	Enabled       bool   `json:"enabled"`
+	Subnet        string `json:"subnet"`
+	InterfaceName string `json:"interfaceName"`
+	MTU           int32  `json:"mtu"`
+}
+
 type VLessOutboundConfig struct {
-	Address    *Address              `json:"address"`
-	Port       uint16                `json:"port"`
-	Level      uint32                `json:"level"`
-	Email      string                `json:"email"`
-	Id         string                `json:"id"`
-	Flow       string                `json:"flow"`
-	Seed       string                `json:"seed"`
-	Encryption string                `json:"encryption"`
-	Reverse    *VLessReverseConfig   `json:"reverse"`
-	Testpre    uint32                `json:"testpre"`
-	Testseed   []uint32              `json:"testseed"`
-	Vnext      []*VLessOutboundVnext `json:"vnext"`
+	Address        *Address                     `json:"address"`
+	Port           uint16                       `json:"port"`
+	Level          uint32                       `json:"level"`
+	Email          string                       `json:"email"`
+	Id             string                       `json:"id"`
+	Flow           string                       `json:"flow"`
+	Seed           string                       `json:"seed"`
+	Encryption     string                       `json:"encryption"`
+	Reverse        *VLessReverseConfig          `json:"reverse"`
+	Testpre        uint32                       `json:"testpre"`
+	Testseed       []uint32                     `json:"testseed"`
+	Vnext          []*VLessOutboundVnext        `json:"vnext"`
+	VirtualNetwork *VLessOutboundVirtualNetwork `json:"virtualNetwork"`
 }
 
 // Build implements Buildable
@@ -394,6 +405,15 @@ func (c *VLessOutboundConfig) Build() (proto.Message, error) {
 		}
 		config.Vnext = spec
 		break
+	}
+
+	if c.VirtualNetwork != nil {
+		config.VirtualNetwork = &outbound.VirtualNetwork{
+			Enabled:       c.VirtualNetwork.Enabled,
+			Subnet:        c.VirtualNetwork.Subnet,
+			InterfaceName: c.VirtualNetwork.InterfaceName,
+			Mtu:           c.VirtualNetwork.MTU,
+		}
 	}
 
 	return config, nil
