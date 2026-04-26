@@ -87,6 +87,36 @@ func writeFrame(w io.Writer, pkt []byte) error {
 	return err
 }
 
+// PreambleSize is the number of bytes the server writes once, immediately
+// after the VLESS handshake and before any framed packets, announcing the
+// virtual IPv4 address it has assigned to this user. The client reads
+// exactly PreambleSize bytes, assigns them to its TUN, then switches into
+// framed-packet mode.
+//
+// We keep this as a fixed-width unframed preamble (rather than e.g. a
+// framed packet with magic bytes) so that the client's state machine is
+// trivial: "read 4 bytes, then read frames forever". Changing this
+// contract would be a client/server ABI break.
+const PreambleSize = 4
+
+// WriteIPPreamble writes the 4-byte IPv4 address preamble to w. This is
+// the server's side of the "here is your assigned IP" announcement.
+func WriteIPPreamble(w io.Writer, ip [4]byte) error {
+	_, err := w.Write(ip[:])
+	return err
+}
+
+// ReadIPPreamble reads exactly PreambleSize bytes from r, returning them
+// as an IPv4 address. It is the inverse of WriteIPPreamble and must be
+// called on the client exactly once, before any framed reads.
+func ReadIPPreamble(r io.Reader) ([4]byte, error) {
+	var b [PreambleSize]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return [4]byte{}, err
+	}
+	return b, nil
+}
+
 // ipv4Header is a minimal view over the bytes of an IPv4 packet. We only
 // need version + src + dst to drive routing, so we avoid a full parser.
 type ipv4Header struct {

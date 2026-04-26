@@ -8,6 +8,25 @@ option java_multiple_files = true;
 
 import "common/protocol/server_spec.proto";
 
+// VirtualNetwork, when enabled, switches this outbound into L3 tunnel mode:
+// after the standard VLESS handshake the connection becomes a
+// length-prefixed IPv4 stream (see proxy/vless/virtualnet) and a real
+// system TUN interface is created on the client side with the IP the
+// server announces. All traffic destined to the configured subnet is
+// routed through the tunnel.
+message VirtualNetwork {
+  bool enabled = 1;
+  // Subnet is the virtual network the server is announcing (e.g.
+  // "10.0.0.0/24"). Optional; defaults to 10.0.0.0/24.
+  string subnet = 2;
+  // InterfaceName is the preferred kernel interface name. Ignored on
+  // darwin (utunN is kernel-assigned). Optional; defaults to "xray0".
+  string interface_name = 3;
+  // MTU is the TUN interface MTU. 0 means use the package default.
+  int32 mtu = 4;
+}
+
 message Config {
   xray.common.protocol.ServerEndpoint vnext = 1;
+  VirtualNetwork virtual_network = 2;
 }
