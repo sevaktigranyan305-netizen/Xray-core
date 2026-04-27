@@ -75,11 +75,11 @@ type Handler struct {
 // default (nil) zero value keeps the Handler's hot path free of extra
 // branches. Populated in New() only if config.VirtualNetwork.Enabled.
 type l3State struct {
-	client    *l3client.Client
-	subnet    netip.Prefix
-	bootCtx   context.Context
+	client     *l3client.Client
+	subnet     netip.Prefix
+	bootCtx    context.Context
 	cancelBoot context.CancelFunc
-	done      chan struct{}
+	done       chan struct{}
 }
 
 type ConnExpire struct {
@@ -152,6 +152,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	handler.testpre = a.Testpre
 
 	if vn := config.VirtualNetwork; vn != nil && vn.Enabled {
+		errors.LogInfo(ctx, "virtualNetwork: activating L3 client (subnet=", vn.Subnet, ", interfaceName=", vn.InterfaceName, ", mtu=", vn.Mtu, ", defaultRoute=", vn.DefaultRoute, ")")
 		subnetStr := vn.Subnet
 		if subnetStr == "" {
 			subnetStr = "10.0.0.0/24"
@@ -169,6 +170,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		if err != nil {
 			return nil, errors.New("virtualNetwork client").Base(err)
 		}
+		errors.LogInfo(ctx, "virtualNetwork: l3client created, scheduling bootstrap goroutine")
 		// ctx here already carries session.FullHandler (set by
 		// proxyman/outbound.NewHandler). We capture it for
 		// runL3Bootstrap which needs to synthesise per-attempt

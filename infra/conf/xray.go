@@ -218,6 +218,13 @@ type OutboundDetourConfig struct {
 	ProxySettings  *ProxyConfig     `json:"proxySettings"`
 	MuxSettings    *MuxConfig       `json:"mux"`
 	TargetStrategy string           `json:"targetStrategy"`
+	// VirtualNetwork accepts the L3 virtual-network block at the outbound
+	// top level (sibling of "settings"/"streamSettings"). Some clients —
+	// including the 3x-ui fork — emit it there instead of inside
+	// "settings". When present and the protocol is vless, it is spliced
+	// into the settings JSON before the per-protocol loader runs so
+	// VLessOutboundConfig.VirtualNetwork is populated either way.
+	VirtualNetwork *json.RawMessage `json:"virtualNetwork"`
 }
 
 func (c *OutboundDetourConfig) checkChainProxyConfig() error {
@@ -318,6 +325,27 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	settings := []byte("{}")
 	if c.Settings != nil {
 		settings = ([]byte)(*c.Settings)
+	}
+	// Splice top-level outbound "virtualNetwork" block into settings for
+	// protocols that read it from there (currently VLESS). Without this,
+	// configs that follow the documented client-side layout
+	// ({"protocol":"vless","settings":{...},"virtualNetwork":{...}}) would
+	// have the virtualNetwork field silently dropped because the JSON
+	// parser only inspects "settings".
+	if c.VirtualNetwork != nil && strings.EqualFold(c.Protocol, "vless") {
+		merged := map[string]json.RawMessage{}
+		if len(settings) > 0 {
+			if err := json.Unmarshal(settings, &merged); err != nil {
+				return nil, errors.New("failed to merge virtualNetwork into outbound settings").Base(err)
+			}
+		}
+		merged["virtualNetwork"] = *c.VirtualNetwork
+		spliced, err := json.Marshal(merged)
+		if err != nil {
+			return nil, errors.New("failed to marshal merged outbound settings").Base(err)
+		}
+		settings = spliced
+		errors.LogInfo(context.Background(), "outbound ", c.Tag, ": top-level virtualNetwork spliced into vless settings")
 	}
 	rawConfig, err := outboundConfigLoader.LoadWithID(settings, c.Protocol)
 	if err != nil {
