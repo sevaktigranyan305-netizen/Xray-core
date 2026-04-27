@@ -1,4 +1,4 @@
-fork that adds L3, work in progress
+fork that adds full VPN for VLESS (vless rn is a proxy), work in progress
 
 # Project X
 
