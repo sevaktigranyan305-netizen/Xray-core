@@ -10,20 +10,27 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # `name` drives the published asset suffix (xray-${name}.zip) and
+        # matches the convention sevaktigranyan305-netizen/3x-ui already
+        # uses when it renames its extracted binary to xray-<os>-<arch>.
+        # `goarm` is only set for 32-bit ARM variants.
         include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
+          - { goos: linux,   goarch: amd64,           name: linux-amd64 }
+          - { goos: linux,   goarch: '386',           name: linux-386 }
+          - { goos: linux,   goarch: arm64,           name: linux-arm64 }
+          - { goos: linux,   goarch: arm,   goarm: 7, name: linux-armv7 }
+          - { goos: linux,   goarch: arm,   goarm: 6, name: linux-armv6 }
+          - { goos: linux,   goarch: arm,   goarm: 5, name: linux-armv5 }
+          - { goos: linux,   goarch: s390x,           name: linux-s390x }
+          - { goos: windows, goarch: amd64,           name: windows-amd64 }
+          - { goos: darwin,  goarch: amd64,           name: darwin-amd64 }
+          - { goos: darwin,  goarch: arm64,           name: darwin-arm64 }
+          - { goos: android, goarch: arm64,           name: android-arm64 }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,31 +41,68 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      # Android builds need CGO + an NDK cross-compiler. All other targets
+      # build statically with CGO_ENABLED=0.
+      - name: Set up Android NDK
+        if: matrix.goos == 'android'
+        run: |
+          wget -qO android-ndk.zip https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          unzip -q android-ndk.zip
+          rm android-ndk.zip
+          NDK_BIN="$(realpath android-ndk-*/toolchains/llvm/prebuilt/linux-x86_64/bin)"
+          case "${{ matrix.goarch }}" in
+            arm64) CC="${NDK_BIN}/aarch64-linux-android24-clang" ;;
+            amd64) CC="${NDK_BIN}/x86_64-linux-android24-clang" ;;
+            *)     echo "unsupported android arch ${{ matrix.goarch }}" >&2; exit 1 ;;
+          esac
+          echo "CC=${CC}" >> "$GITHUB_ENV"
+
       - name: Show toolchain
         run: |
           go version
-          echo "GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}"
+          echo "GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} name=${{ matrix.name }}"
 
       - name: Build xray
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          # Default to a static build for every non-android target. The
+          # linux-amd64 entry runs natively on the ubuntu-latest runner
+          # (not cross-compiled), so without an explicit CGO_ENABLED=0
+          # Go would dynamically link against the runner's libc and the
+          # resulting binary would fail in minimal envs (Alpine, scratch
+          # Docker images, etc.). The android branch in the script
+          # below overrides this to CGO_ENABLED=1 so the NDK toolchain
+          # is actually used.
           CGO_ENABLED: 0
         run: |
           mkdir -p dist
-          go build -v -trimpath -ldflags "-s -w -buildid=" -o dist/xray ./main
+          if [[ "${GOOS}" == "android" ]]; then
+            export CGO_ENABLED=1
+          fi
+          if [[ "${GOOS}" == "windows" ]]; then
+            go build -v -trimpath -ldflags "-s -w -buildid=" -o dist/xray.exe ./main
+          else
+            go build -v -trimpath -ldflags "-s -w -buildid=" -o dist/xray ./main
+          fi
 
       - name: Package zip
         run: |
           cd dist
-          zip -j "xray-${{ matrix.goos }}-${{ matrix.goarch }}.zip" xray
-          rm xray
-          sha256sum "xray-${{ matrix.goos }}-${{ matrix.goarch }}.zip" > "xray-${{ matrix.goos }}-${{ matrix.goarch }}.zip.sha256"
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            zip -j "xray-${{ matrix.name }}.zip" xray.exe
+            rm xray.exe
+          else
+            zip -j "xray-${{ matrix.name }}.zip" xray
+            rm xray
+          fi
+          sha256sum "xray-${{ matrix.name }}.zip" > "xray-${{ matrix.name }}.zip.sha256"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xray-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: xray-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
