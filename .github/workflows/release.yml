@@ -42,7 +42,7 @@ jobs:
           check-latest: true
 
       # Android builds need CGO + an NDK cross-compiler. All other targets
-      # build cleanly with CGO_ENABLED=0 and the standard Go toolchain.
+      # build statically with CGO_ENABLED=0.
       - name: Set up Android NDK
         if: matrix.goos == 'android'
         run: |
@@ -55,10 +55,7 @@ jobs:
             amd64) CC="${NDK_BIN}/x86_64-linux-android24-clang" ;;
             *)     echo "unsupported android arch ${{ matrix.goarch }}" >&2; exit 1 ;;
           esac
-          {
-            echo "CC=${CC}"
-            echo "CGO_ENABLED=1"
-          } >> "$GITHUB_ENV"
+          echo "CC=${CC}" >> "$GITHUB_ENV"
 
       - name: Show toolchain
         run: |
@@ -70,12 +67,20 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
-          # CGO_ENABLED is left unset here so the Android NDK step's
-          # GITHUB_ENV value (CGO_ENABLED=1) wins for that target. For
-          # every other target Go defaults CGO_ENABLED to 0 when
-          # cross-compiling, which is exactly what we want.
+          # Default to a static build for every non-android target. The
+          # linux-amd64 entry runs natively on the ubuntu-latest runner
+          # (not cross-compiled), so without an explicit CGO_ENABLED=0
+          # Go would dynamically link against the runner's libc and the
+          # resulting binary would fail in minimal envs (Alpine, scratch
+          # Docker images, etc.). The android branch in the script
+          # below overrides this to CGO_ENABLED=1 so the NDK toolchain
+          # is actually used.
+          CGO_ENABLED: 0
         run: |
           mkdir -p dist
+          if [[ "${GOOS}" == "android" ]]; then
+            export CGO_ENABLED=1
+          fi
           if [[ "${GOOS}" == "windows" ]]; then
             go build -v -trimpath -ldflags "-s -w -buildid=" -o dist/xray.exe ./main
           else
