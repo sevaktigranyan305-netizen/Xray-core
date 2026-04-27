@@ -13,6 +13,14 @@ import (
 	wgtun "golang.zx2c4.com/wireguard/tun"
 )
 
+// darwinAFHdrLen is the 4-byte address-family prefix that
+// wireguard/tun's darwin backend prepends to every utun frame
+// (PF_INET = 0x02). wgtun.NativeTun.Read does
+// `bufs[0][offset-4:]` and panics if offset<4; Write rejects
+// offset<4 with io.ErrShortBuffer. We pass exactly 4 and reserve
+// the same amount of leading headroom in our read/write buffers.
+const darwinAFHdrLen = 4
+
 // darwinDevice is the macOS implementation of Device. It wraps
 // wireguard/tun's utun-based device and shells out to /sbin/ifconfig and
 // /sbin/route for address and route management — macOS has no libnetlink
@@ -71,10 +79,11 @@ func newDevice(cfg deviceConfig) (Device, error) {
 		subnet: cfg.Subnet,
 		ip:     cfg.IP,
 	}
-	// Darwin wireguard/tun does not use virtio-net-hdr, so read buffers
-	// need no leading headroom. We still reserve a small fixed slack
-	// above the MTU to be defensive against oversized packets.
-	d.readBuf[0] = make([]byte, mtu+128)
+	// Darwin wireguard/tun prepends a 4-byte address-family header
+	// (PF_INET) on every utun frame, so the read buffer must reserve
+	// darwinAFHdrLen of leading headroom in addition to the MTU. The
+	// extra 128 is defensive slack against oversized packets.
+	d.readBuf[0] = make([]byte, darwinAFHdrLen+mtu+128)
 
 	gateway := gatewayOf(cfg.Subnet)
 	ifconfigArgs := []string{
@@ -170,7 +179,7 @@ func (d *darwinDevice) Name() string { return d.name }
 func (d *darwinDevice) Read(p []byte) (int, error) {
 	d.readBuf[0] = d.readBuf[0][:cap(d.readBuf[0])]
 	d.readSizes[0] = 0
-	n, err := d.tun.Read(d.readBuf[:], d.readSizes[:], 0)
+	n, err := d.tun.Read(d.readBuf[:], d.readSizes[:], darwinAFHdrLen)
 	if err != nil {
 		return 0, err
 	}
@@ -181,19 +190,20 @@ func (d *darwinDevice) Read(p []byte) (int, error) {
 	if sz > len(p) {
 		return 0, fmt.Errorf("l3client: packet length %d exceeds buffer %d", sz, len(p))
 	}
-	copy(p, d.readBuf[0][:sz])
+	copy(p, d.readBuf[0][darwinAFHdrLen:darwinAFHdrLen+sz])
 	return sz, nil
 }
 
 func (d *darwinDevice) Write(p []byte) (int, error) {
-	if cap(d.writeBufMu.buf) < len(p) {
-		d.writeBufMu.buf = make([]byte, len(p))
+	need := darwinAFHdrLen + len(p)
+	if cap(d.writeBufMu.buf) < need {
+		d.writeBufMu.buf = make([]byte, need)
 	} else {
-		d.writeBufMu.buf = d.writeBufMu.buf[:len(p)]
+		d.writeBufMu.buf = d.writeBufMu.buf[:need]
 	}
-	copy(d.writeBufMu.buf, p)
+	copy(d.writeBufMu.buf[darwinAFHdrLen:], p)
 	bufs := [1][]byte{d.writeBufMu.buf}
-	_, err := d.tun.Write(bufs[:], 0)
+	_, err := d.tun.Write(bufs[:], darwinAFHdrLen)
 	if err != nil {
 		return 0, err
 	}
