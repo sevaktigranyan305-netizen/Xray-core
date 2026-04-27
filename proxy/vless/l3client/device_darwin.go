@@ -47,11 +47,14 @@ func newDevice(cfg deviceConfig) (Device, error) {
 		mtu = MTU
 	}
 
-	// macOS utun devices are always named utunN; passing "" lets the
-	// kernel pick the lowest free index. We ignore cfg.Name entirely
+	// macOS utun devices are always named utunN. wireguard/tun's
+	// CreateTUN requires the literal string "utun" to make the kernel
+	// pick the lowest free index; passing "" (or anything else that
+	// doesn't match "utun%d") fails its name-parse with
+	// `Interface name must be utun[0-9]*`. We ignore cfg.Name entirely
 	// rather than silently rejecting conflicting user choices, because
 	// the user-visible name is irrelevant for our use case.
-	tun, err := wgtun.CreateTUN("", mtu)
+	tun, err := wgtun.CreateTUN("utun", mtu)
 	if err != nil {
 		return nil, fmt.Errorf("l3client: create tun: %w", err)
 	}
