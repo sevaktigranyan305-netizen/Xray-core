@@ -170,6 +170,19 @@ func TestVirtualNetworkConnHandlerEmptyTagWhenUnset(t *testing.T) {
 // interface owns it. With the fix the dispatcher receives 127.0.0.1
 // so the dial lands on the host's loopback and reaches services
 // bound to 0.0.0.0.
+//
+// In addition to rewriting the destination, the handler must rename
+// inbound.Name away from "vless" so that freedom's
+// defaultPrivateBlockIPMatcher (which treats 127.0.0.0/8 as a private
+// destination to block for inbound names like vless / vmess / trojan
+// / hysteria / wireguard / shadowsocks*) does not refuse the dial.
+// Skipping the rename was the cause of "Empty reply from server"
+// observed in end-to-end testing on v0.0.7-test and v0.0.8-test:
+// the dispatcher correctly dialed 127.0.0.1, but freedom then closed
+// the connection with "blocked target IP: 127.0.0.1" in its access
+// log because inbound.Name was still "vless". Renaming to
+// "virtualnet-gateway" is intentional and scoped to gateway-IP
+// rewritten flows only.
 func TestVirtualNetworkConnHandlerRewritesGatewayDestToLoopback(t *testing.T) {
 	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
 		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
@@ -204,6 +217,11 @@ func TestVirtualNetworkConnHandlerRewritesGatewayDestToLoopback(t *testing.T) {
 	}
 	if got, want := uint16(disp.dst[0].Port), uint16(4747); got != want {
 		t.Errorf("dst.Port = %d, want %d (port must be preserved)", got, want)
+	}
+	if got := disp.inbounds[0]; got == nil {
+		t.Fatalf("session.Inbound missing on dispatched ctx")
+	} else if got.Name != "virtualnet-gateway" {
+		t.Errorf("inbound.Name = %q, want %q (otherwise freedom's defaultPrivateBlockIPMatcher will reject the loopback dial)", got.Name, "virtualnet-gateway")
 	}
 }
 
@@ -249,6 +267,11 @@ func TestVirtualNetworkConnHandlerLeavesNonGatewayDestUntouched(t *testing.T) {
 			}
 			if got := disp.dst[0].Address.String(); got != tc.ip {
 				t.Errorf("dst.Address = %q, want %q (must not be rewritten)", got, tc.ip)
+			}
+			if got := disp.inbounds[0]; got == nil {
+				t.Fatalf("session.Inbound missing on dispatched ctx")
+			} else if got.Name != "vless" {
+				t.Errorf("inbound.Name = %q, want %q (rename is reserved for gateway-IP rewrite path)", got.Name, "vless")
 			}
 		})
 	}

@@ -315,11 +315,25 @@ func (h *Handler) virtualNetworkConnHandler() virtualnet.ConnHandler {
 		// Rewriting to 127.0.0.1 here makes the gateway IP semantically
 		// equivalent to "the host running xray", which matches what
 		// users coming from a WireGuard background expect.
+		//
+		// We also rename inbound.Name to "virtualnet-gateway" so that
+		// freedom's defaultPrivateBlockIPMatcher doesn't refuse the
+		// dial: that matcher is automatically applied for inbounds
+		// whose Name is "vless" / "vmess" / "trojan" / "hysteria" /
+		// "wireguard" / "shadowsocks*" (see proxy/freedom/freedom.go
+		// getBlockedIPMatcher), and it considers 127.0.0.0/8 a
+		// blocked private destination — which would otherwise close
+		// the connection right after dial with the inbound observing
+		// "empty reply from server". Hitting the host loopback is
+		// exactly what the gateway-IP rewrite is meant to enable, so
+		// stepping outside that policy here is intentional and the
+		// scope is the one rewritten flow only.
 		dispatchDst := dst
 		if dispatchDst.Address.Family().IsIP() && h.vnet != nil {
 			if hostIP, ok := netip.AddrFromSlice(dispatchDst.Address.IP()); ok {
 				if hostIP.Unmap() == h.vnet.Gateway() {
 					dispatchDst.Address = net.LocalHostIP
+					inbound.Name = "virtualnet-gateway"
 				}
 			}
 		}
