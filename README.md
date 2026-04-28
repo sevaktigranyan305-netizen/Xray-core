@@ -1,216 +1,183 @@
-fork that adds full VPN for VLESS (vless rn is a proxy), work in progress
+# Xray-core (VLESS L3 / VPN fork)
 
-# Project X
+[English](./README.md) · [Русский](./README.ru.md)
 
-[Project X](https://github.com/XTLS) originates from XTLS protocol, providing a set of network tools such as [Xray-core](https://github.com/XTLS/Xray-core) and [REALITY](https://github.com/XTLS/REALITY).
+This is a soft fork of [XTLS/Xray-core](https://github.com/XTLS/Xray-core) that turns the VLESS protocol from a stream proxy into a real Layer-3 VPN. Connected clients get a virtual IP inside a configurable subnet, can address the server's host services through the gateway IP, and can reach each other peer-to-peer. The fork keeps the rest of Xray-core (REALITY, XHTTP, XUDP, routing, sniffing, balancers, etc.) byte-compatible with upstream — you can run a stock VLESS-REALITY setup on this build with no behavioural change.
 
-[README](https://github.com/XTLS/Xray-core#readme) is open, so feel free to submit your project [here](https://github.com/XTLS/Xray-core/pulls).
+> **Status: testing.** Releases are tagged `v0.0.x-test` while the protocol additions and the wire format are stabilised. It is safe to deploy alongside non-VPN VLESS clients on the same inbound, but please don't pin production users to a specific test release yet.
 
-## Sponsors
+## What this fork adds
 
-[![Remnawave](https://github.com/user-attachments/assets/a22d34ae-01ee-441c-843a-85356748ed1e)](https://docs.rw)
+| | Upstream Xray-core | This fork |
+|---|---|---|
+| VLESS as a stream proxy (TCP / UDP per connection) | ✓ | ✓ |
+| Per-client virtual IPv4 inside a subnet | — | ✓ |
+| Kernel TUN interface on the client (Linux / Darwin) | — | ✓ |
+| `ping` / ICMP across the tunnel | — | ✓ |
+| Peer-to-peer between connected clients (10.0.0.x ↔ 10.0.0.y) | — | ✓ |
+| Reach VPS host services via the gateway IP (`curl http://10.0.0.1:port`) | — | ✓ |
+| `inbound.Tag` propagated to L3 sub-flows so `inboundTag:` routing rules work | — | ✓ |
 
-[![Happ](https://github.com/user-attachments/assets/14055dab-e8bb-48bd-89e8-962709e4098e)](https://happ.su)
+The user-visible config is a single optional `virtualNetwork` block on the VLESS inbound (server side) and on the VLESS outbound (client side). When the block is absent, VLESS behaves exactly like upstream.
 
-[![BlancVPN](https://github.com/user-attachments/assets/9145ea7d-5da3-446e-8143-710dba4292c3)](https://blanc.link/VMTSDqW)
+## How it works (one-paragraph version)
 
-[**Sponsor Xray-core**](https://github.com/XTLS/Xray-core/issues/3668)
+When a client connects, it sends an extended VLESS request carrying the user's UUID. The server's IPAM assigns or recalls a virtual IPv4 from the configured subnet for that UUID, replies with a 4-byte preamble carrying `(assigned_ip, gateway_ip, prefix_len)`, and from then on both sides exchange raw IPv4 packets over the same VLESS stream using a 2-byte length prefix. Server-side, packets enter a [gVisor](https://github.com/google/gvisor) userspace netstack: TCP/UDP destined to peer addresses is forwarded directly between client streams, and TCP/UDP destined to the gateway is rewritten to loopback and dispatched through the normal Xray outbound chain (so routing rules, freedom, blackhole, `domain:` rules, etc. all keep working). Client-side, on Linux and macOS the outbound creates a kernel TUN interface (`xray0` by default), assigns the virtual IP, and bridges it 1:1 with the framed VLESS stream.
 
-## Donation & NFTs
+## Server-side example
 
-### [Collect a Project X NFT to support the development of Project X!](https://opensea.io/item/ethereum/0x5ee362866001613093361eb8569d59c4141b76d1/1)
+Add the `virtualNetwork` block to your VLESS inbound:
 
-[<img alt="Project X NFT" width="150px" src="https://raw2.seadn.io/ethereum/0x5ee362866001613093361eb8569d59c4141b76d1/7fa9ce900fb39b44226348db330e32/8b7fa9ce900fb39b44226348db330e32.svg" />](https://opensea.io/item/ethereum/0x5ee362866001613093361eb8569d59c4141b76d1/1)
+```jsonc
+{
+  "inbounds": [
+    {
+      "tag": "inbound-443",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "11111111-1111-1111-1111-111111111111", "email": "alice" },
+          { "id": "22222222-2222-2222-2222-222222222222", "email": "bob"   }
+        ],
+        "decryption": "none",
+        "virtualNetwork": {
+          "enabled": true,
+          "subnet": "10.0.0.0/24",
+          "persistMapping": true
+        }
+      },
+      "streamSettings": { /* REALITY / XHTTP / etc. — unchanged */ }
+    }
+  ]
+}
+```
 
-- **TRX(Tron)/USDT/USDC: `TNrDh5VSfwd4RPrwsohr6poyNTfFefNYan`**
-- **TON: `UQApeV-u2gm43aC1uP76xAC1m6vCylstaN1gpfBmre_5IyTH`**
-- **BTC: `1JpqcziZZuqv3QQJhZGNGBVdCBrGgkL6cT`**
-- **XMR: `4ABHQZ3yJZkBnLoqiKvb3f8eqUnX4iMPb6wdant5ZLGQELctcerceSGEfJnoCk6nnyRZm73wrwSgvZ2WmjYLng6R7sR67nq`**
-- **SOL/USDT/USDC: `3x5NuXHzB5APG6vRinPZcsUv5ukWUY1tBGRSJiEJWtZa`**
-- **ETH/USDT/USDC: `0xDc3Fe44F0f25D13CACb1C4896CD0D321df3146Ee`**
-- **Project X NFT: https://opensea.io/item/ethereum/0x5ee362866001613093361eb8569d59c4141b76d1/1**
-- **VLESS NFT: https://opensea.io/collection/vless**
-- **REALITY NFT: https://opensea.io/item/ethereum/0x5ee362866001613093361eb8569d59c4141b76d1/2**
-- **Related links: [VLESS Post-Quantum Encryption](https://github.com/XTLS/Xray-core/pull/5067), [XHTTP: Beyond REALITY](https://github.com/XTLS/Xray-core/discussions/4113), [Announcement of NFTs by Project X](https://github.com/XTLS/Xray-core/discussions/3633)**
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. When `false` the inbound behaves exactly like upstream VLESS. |
+| `subnet` | `10.0.0.0/24` | IPv4 subnet handed out by the IPAM. The first usable address is the gateway. |
+| `persistMapping` | `true` | Persist `UUID → virtual IP` mappings across restarts so the same client always gets the same IP. |
 
-## License
+The gateway IP (e.g. `10.0.0.1` for `10.0.0.0/24`) is reserved by the gVisor netstack. Connections to the gateway IP are rewritten to `127.0.0.1` on the host so they reach services bound on `0.0.0.0` or loopback. Connections to other addresses inside the subnet are matched against the IPAM and forwarded into the owning client's stream (peer-to-peer); connections to addresses outside the subnet are dispatched through the normal Xray outbound chain (routing rules, freedom, blackhole, …).
 
-[Mozilla Public License Version 2.0](https://github.com/XTLS/Xray-core/blob/main/LICENSE)
+## Client-side example (Linux / macOS)
 
-## Documentation
+The client outbound creates a kernel TUN device. **You need root** (or `cap_net_admin`).
 
-[Project X Official Website](https://xtls.github.io)
+```jsonc
+{
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "vps.example.com",
+          "port":    443,
+          "users": [{
+            "id":         "11111111-1111-1111-1111-111111111111",
+            "encryption": "none",
+            "flow":       ""
+          }]
+        }],
+        "virtualNetwork": {
+          "enabled":       true,
+          "subnet":        "10.0.0.0/24",
+          "interfaceName": "xray0",
+          "mtu":           1420,
+          "defaultRoute":  true
+        }
+      },
+      "streamSettings": { /* REALITY / XHTTP / etc. */ }
+    }
+  ]
+}
+```
 
-## Telegram
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. When `false` the outbound behaves exactly like upstream VLESS. |
+| `subnet` | `10.0.0.0/24` | Must match the server. |
+| `interfaceName` | `xray0` | Name of the kernel TUN device created on the host. |
+| `mtu` | `1420` | TUN MTU. The default leaves headroom for the VLESS / TLS / IP layers below. |
+| `defaultRoute` | `true` | When `true`, the outbound rewrites the host's default route through the TUN, i.e. **all** traffic goes through the tunnel. Set to `false` for split-tunnel — only the subnet is routed through the TUN, the rest of the host's traffic stays on its existing default route. |
 
-[Project X](https://t.me/projectXray)
+After `xray run`, the host should have:
 
-[Project X Channel](https://t.me/projectXtls)
+```
+$ ip addr show xray0
+xray0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP>
+    inet 10.0.0.45/24 scope global xray0
 
-[Project VLESS](https://t.me/projectVless) (Русский)
+$ ping 10.0.0.1                # gateway (server's gVisor stack)
+$ curl http://10.0.0.1:8080    # VPS host service listening on 0.0.0.0:8080
+$ ping 10.0.0.46               # another connected client (peer-to-peer)
+$ curl https://example.com     # only when defaultRoute=true
+```
 
-[Project XHTTP](https://t.me/projectXhttp) (Persian)
+## `vless://` link extensions
 
-## Installation
+The fork's `vless://` URI parser recognises three extra query parameters so a single share-link can carry the VPN config:
 
-- Linux Script
-  - [XTLS/Xray-install](https://github.com/XTLS/Xray-install) (**Official**)
-  - [tempest](https://github.com/team-cloudchaser/tempest) (supports [`systemd`](https://systemd.io) and [OpenRC](https://github.com/OpenRC/openrc); Linux-only)
-- Docker
-  - [ghcr.io/xtls/xray-core](https://ghcr.io/xtls/xray-core) (**Official**)
-  - [teddysun/xray](https://hub.docker.com/r/teddysun/xray)
-  - [wulabing/xray_docker](https://github.com/wulabing/xray_docker)
-- Web Panel
-  - [Remnawave](https://github.com/remnawave/panel)
-  - [3X-UI](https://github.com/MHSanaei/3x-ui)
-  - [PasarGuard](https://github.com/PasarGuard/panel)
-  - [Xray-UI](https://github.com/qist/xray-ui)
-  - [X-Panel](https://github.com/xeefei/X-Panel)
-  - [Marzban](https://github.com/Gozargah/Marzban)
-  - [Hiddify](https://github.com/hiddify/Hiddify-Manager)
-  - [TX-UI](https://github.com/AghayeCoder/tx-ui)
-  - [CELERITY](https://github.com/ClickDevTech/CELERITY-panel)
-- One Click
-  - [Xray-REALITY](https://github.com/zxcvos/Xray-script), [xray-reality](https://github.com/sajjaddg/xray-reality), [reality-ezpz](https://github.com/aleskxyz/reality-ezpz)
-  - [Xray_bash_onekey](https://github.com/hello-yunshu/Xray_bash_onekey), [XTool](https://github.com/LordPenguin666/XTool), [VPainLess](https://github.com/vpainless/vpainless)
-  - [v2ray-agent](https://github.com/mack-a/v2ray-agent), [Xray_onekey](https://github.com/wulabing/Xray_onekey), [ProxySU](https://github.com/proxysu/ProxySU)
-- Magisk
-  - [NetProxy-Magisk](https://github.com/Fanju6/NetProxy-Magisk)
-  - [Xray4Magisk](https://github.com/Asterisk4Magisk/Xray4Magisk)
-  - [Xray_For_Magisk](https://github.com/E7KMbb/Xray_For_Magisk)
-- Homebrew
-  - `brew install xray`
+| Param | Meaning |
+|---|---|
+| `vnet=1` | Enable `virtualNetwork` on the outbound. |
+| `vnetSubnet=10.0.0.0/24` | Override `subnet`. URL-encode the slash as `%2F`. |
+| `vnetDefaultRoute=1` / `vnetDefaultRoute=0` | Override `defaultRoute`. |
 
-## Usage
+A complete share link looks like:
 
-- Example
-  - [VLESS-XTLS-uTLS-REALITY](https://github.com/XTLS/REALITY#readme)
-  - [VLESS-TCP-XTLS-Vision](https://github.com/XTLS/Xray-examples/tree/main/VLESS-TCP-XTLS-Vision)
-  - [All-in-One-fallbacks-Nginx](https://github.com/XTLS/Xray-examples/tree/main/All-in-One-fallbacks-Nginx)
-- Xray-examples
-  - [XTLS/Xray-examples](https://github.com/XTLS/Xray-examples)
-  - [chika0801/Xray-examples](https://github.com/chika0801/Xray-examples)
-  - [lxhao61/integrated-examples](https://github.com/lxhao61/integrated-examples)
-- Tutorial
-  - [XTLS Vision](https://github.com/chika0801/Xray-install)
-  - [REALITY (English)](https://cscot.pages.dev/2023/03/02/Xray-REALITY-tutorial/)
-  - [XTLS-Iran-Reality (English)](https://github.com/SasukeFreestyle/XTLS-Iran-Reality)
-  - [Xray REALITY with 'steal oneself' (English)](https://computerscot.github.io/vless-xtls-utls-reality-steal-oneself.html)
-  - [Xray with WireGuard inbound (English)](https://g800.pages.dev/wireguard)
+```
+vless://<uuid>@vps.example.com:443?type=tcp&security=reality&pbk=...&fp=chrome&sni=...&sid=...&spx=%2F&vnet=1&vnetSubnet=10.0.0.0%2F24&vnetDefaultRoute=1#vps
+```
 
-## GUI Clients
+Clients that don't understand the new params silently ignore them and behave as a stock VLESS proxy.
 
-- OpenWrt
-  - [PassWall](https://github.com/Openwrt-Passwall/openwrt-passwall), [PassWall 2](https://github.com/Openwrt-Passwall/openwrt-passwall2)
-  - [ShadowSocksR Plus+](https://github.com/fw876/helloworld)
-  - [luci-app-xray](https://github.com/yichya/luci-app-xray) ([openwrt-xray](https://github.com/yichya/openwrt-xray))
-- Asuswrt-Merlin
-  - [XRAYUI](https://github.com/DanielLavrushin/asuswrt-merlin-xrayui)
-  - [fancyss](https://github.com/hq450/fancyss)
-- Windows
-  - [v2rayN](https://github.com/2dust/v2rayN)
-  - [Furious](https://github.com/LorenEteval/Furious)
-  - [Invisible Man - Xray](https://github.com/InvisibleManVPN/InvisibleMan-XRayClient)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [GenyConnect](https://github.com/genyleap/GenyConnect)
-- Android
-  - [v2rayNG](https://github.com/2dust/v2rayNG)
-  - [X-flutter](https://github.com/XTLS/X-flutter)
-  - [SaeedDev94/Xray](https://github.com/SaeedDev94/Xray)
-  - [SimpleXray](https://github.com/lhear/SimpleXray)
-  - [XrayFA](https://github.com/Q7DF1/XrayFA)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [NetProxy-Magisk](https://github.com/Fanju6/NetProxy-Magisk)
-- iOS & macOS arm64 & tvOS
-  - [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215) | [Happ RU](https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973) | [Happ tvOS](https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274)
-  - [Streisand](https://apps.apple.com/app/streisand/id6450534064)
-  - [OneXray](https://github.com/OneXray/OneXray)
-  - [INCY](https://apps.apple.com/en/app/incy/id6756943388)
-- macOS arm64 & x64
-  - [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215) | [Happ RU](https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973)
-  - [V2rayU](https://github.com/yanue/V2rayU)
-  - [V2RayXS](https://github.com/tzmax/V2RayXS)
-  - [Furious](https://github.com/LorenEteval/Furious)
-  - [OneXray](https://github.com/OneXray/OneXray)
-  - [GoXRay](https://github.com/goxray/desktop)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [v2rayN](https://github.com/2dust/v2rayN)
-  - [GenyConnect](https://github.com/genyleap/GenyConnect)
-  - [INCY](https://apps.apple.com/en/app/incy/id6756943388)
-- Linux
-  - [v2rayA](https://github.com/v2rayA/v2rayA)
-  - [Furious](https://github.com/LorenEteval/Furious)
-  - [GorzRay](https://github.com/ketetefid/GorzRay)
-  - [GoXRay](https://github.com/goxray/desktop)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [v2rayN](https://github.com/2dust/v2rayN)
-  - [GenyConnect](https://github.com/genyleap/GenyConnect)
+## 3x-ui companion fork
 
-## Others that support VLESS, XTLS, REALITY, XUDP, PLUX...
+For a panel that exposes the new fields in the UI (per-inbound `virtualNetwork` toggle, subnet editor, share-link generator that emits the `vnet*` params), use the companion 3x-ui fork:
 
-- iOS & macOS arm64 & tvOS
-  - [Shadowrocket](https://apps.apple.com/app/shadowrocket/id932747118)
-  - [Loon](https://apps.apple.com/us/app/loon/id1373567447)
-  - [Egern](https://apps.apple.com/us/app/egern/id1616105820)
-  - [Quantumult X](https://apps.apple.com/us/app/quantumult-x/id1443988620)
-- Xray Tools
-  - [xray-knife](https://github.com/lilendian0x00/xray-knife)
-  - [xray-checker](https://github.com/kutovoys/xray-checker)
-- Xray Wrapper
-  - [XTLS/libXray](https://github.com/XTLS/libXray)
-  - [xtls-sdk](https://github.com/remnawave/xtls-sdk)
-  - [xtlsapi](https://github.com/hiddify/xtlsapi)
-  - [AndroidLibXrayLite](https://github.com/2dust/AndroidLibXrayLite)
-  - [Xray-core-python](https://github.com/LorenEteval/Xray-core-python)
-  - [xray-api](https://github.com/XVGuardian/xray-api)
-- [XrayR](https://github.com/XrayR-project/XrayR)
-  - [XrayR-release](https://github.com/XrayR-project/XrayR-release)
-  - [XrayR-V2Board](https://github.com/missuo/XrayR-V2Board)
-- Cores
-  - [Amnezia VPN](https://github.com/amnezia-vpn)
-  - [mihomo](https://github.com/MetaCubeX/mihomo)
-  - [sing-box](https://github.com/SagerNet/sing-box)
+- https://github.com/sevaktigranyan305-netizen/3x-ui
 
-## Contributing
+It bundles a matching Xray-core binary in every release tarball, so `x-ui update` on the server upgrades both the panel and the core in one step.
 
-[Code of Conduct](https://github.com/XTLS/Xray-core/blob/main/CODE_OF_CONDUCT.md)
+## Routing rules
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/XTLS/Xray-core)
+L3 sub-flows surface in the Xray dispatcher with three pieces of context that routing rules can match on:
+
+- `sourceIP` — the client's virtual IP (e.g. `10.0.0.42`).
+- `inboundTag` — the original VLESS inbound's tag, propagated from the parent connection.
+- `domain` (when sniffing fires) — sniffed from HTTP/TLS like any other inbound.
+
+That means rules like `{"inboundTag":["inbound-443"], "domain":["geosite:cn"], "outboundTag":"direct"}` keep working for tunnel traffic exactly as they do for stock VLESS. Sniffing on L3 sub-flows runs in `RouteOnly` mode — sniffed domains feed the routing engine but never override the dispatch destination, so the gateway-IP rewrite and the peer-to-peer fast path stay intact.
+
+## Building
+
+The build is unchanged from upstream:
+
+```bash
+CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false \
+    -ldflags="-s -w -buildid=" -v ./main
+```
+
+Reproducible / cross-platform builds, the Windows PowerShell variant, and the 32-bit MIPS gotcha are all the same as in upstream — see the upstream [Xray-core README](https://github.com/XTLS/Xray-core#one-line-compilation) for the full set.
+
+Pre-built binaries for every test tag are attached to each [release](https://github.com/sevaktigranyan305-netizen/Xray-core/releases) (Linux / macOS / Windows / FreeBSD / Android — amd64, arm64, 386, arm, mips, mipsle, riscv64, etc., 22 assets total).
+
+## Compatibility & limitations
+
+- **Server platforms:** any platform Xray-core itself supports — the server side is gVisor-only and never touches the kernel.
+- **Client platforms:** kernel TUN works on Linux and macOS (Darwin). Windows / Android / iOS clients can still connect, but currently bring up the TUN through their own platform glue (e.g. the platform's VPN service for Android) — refer to your client's documentation.
+- **IPv6:** the virtual subnet is IPv4-only. The underlying VLESS transport (the TLS / REALITY / XHTTP layer) can run on either v4 or v6.
+- **NAT / port-forwarding from the public internet to a peer:** out of scope. Peers can talk to each other and to the server's host; they're not reachable from the public internet unless you publish them yourself.
+- **`vless://` URI extensions** (`vnet`, `vnetSubnet`, `vnetDefaultRoute`) are a fork-local convention; share-links generated here are still valid stock VLESS links for clients that don't support the VPN mode.
 
 ## Credits
 
-- [Xray-core v1.0.0](https://github.com/XTLS/Xray-core/releases/tag/v1.0.0) was forked from [v2fly-core 9a03cc5](https://github.com/v2fly/v2ray-core/commit/9a03cc5c98d04cc28320fcee26dbc236b3291256), and we have made & accumulated a huge number of enhancements over time, check [the release notes for each version](https://github.com/XTLS/Xray-core/releases).
-- For third-party projects used in [Xray-core](https://github.com/XTLS/Xray-core), check your local or [the latest go.mod](https://github.com/XTLS/Xray-core/blob/main/go.mod).
+- Upstream [Xray-core](https://github.com/XTLS/Xray-core) — everything except the `proxy/vless/virtualnet/` package and the small dispatch-glue patches in `proxy/vless/inbound`, `proxy/vless/outbound`, and `infra/conf` is upstream Xray-core, MPL-2.0.
+- [gVisor](https://github.com/google/gvisor) — the userspace netstack that powers the server side.
+- [wireguard-go](https://git.zx2c4.com/wireguard-go/) — the kernel TUN device wrapper used on the client side.
 
-## One-line Compilation
+## License
 
-### Windows (PowerShell)
-
-```powershell
-$env:CGO_ENABLED=0
-go build -o xray.exe -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -v ./main
-```
-
-### Linux / macOS
-
-```bash
-CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -v ./main
-```
-
-### Reproducible Releases
-
-Make sure that you are using the same Go version, and remember to set the git commit id (7 bytes):
-
-```bash
-CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=REPLACE -s -w -buildid=" -v ./main
-```
-
-If you are compiling a 32-bit MIPS/MIPSLE target, use this command instead:
-
-```bash
-CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=REPLACE -s -w -buildid=" -v ./main
-```
-
-## Stargazers over time
-
-[![Stargazers over time](https://starchart.cc/XTLS/Xray-core.svg)](https://starchart.cc/XTLS/Xray-core)
+[Mozilla Public License 2.0](./LICENSE) — same as upstream Xray-core.
