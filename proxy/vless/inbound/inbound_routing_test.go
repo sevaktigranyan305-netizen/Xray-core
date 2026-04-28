@@ -41,6 +41,7 @@ type captureDispatcher struct {
 	mu       sync.Mutex
 	inbounds []*session.Inbound
 	dst      []net.Destination
+	sniff    []session.SniffingRequest
 }
 
 func (c *captureDispatcher) Type() interface{} { return routing.DispatcherType() }
@@ -62,6 +63,11 @@ func (c *captureDispatcher) record(ctx context.Context, dest net.Destination) {
 	defer c.mu.Unlock()
 	c.inbounds = append(c.inbounds, session.InboundFromContext(ctx))
 	c.dst = append(c.dst, dest)
+	if content := session.ContentFromContext(ctx); content != nil {
+		c.sniff = append(c.sniff, content.SniffingRequest)
+	} else {
+		c.sniff = append(c.sniff, session.SniffingRequest{})
+	}
 }
 
 // TestVirtualNetworkConnHandlerPropagatesInboundTag verifies the bug fix
@@ -245,6 +251,59 @@ func TestVirtualNetworkConnHandlerLeavesNonGatewayDestUntouched(t *testing.T) {
 				t.Errorf("dst.Address = %q, want %q (must not be rewritten)", got, tc.ip)
 			}
 		})
+	}
+}
+
+// TestVirtualNetworkConnHandlerSetsSniffingRouteOnly verifies that the
+// sniffing request attached to L3 sub-flows is created with
+// RouteOnly=true. Without that flag, the dispatcher's HTTP/TLS sniffer
+// would override the dispatch destination by Host/SNI and cancel the
+// gateway-IP rewrite (e.g. an HTTP "Host: 10.0.0.1" header would yank
+// Target back from the rewritten 127.0.0.1 to the unreachable
+// gateway address, defeating the whole point of the rewrite). Domain-
+// based routing rules keep working because RouteOnly populates
+// ob.RouteTarget for the routing engine.
+func TestVirtualNetworkConnHandlerSetsSniffingRouteOnly(t *testing.T) {
+	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
+		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("NewSwitch: %v", err)
+	}
+	defer sw.Close()
+
+	disp := &captureDispatcher{}
+	h := &Handler{
+		defaultDispatcher: disp,
+		validator:         new(vless.MemoryValidator),
+		vnet:              sw,
+		ctx:               xrayCtxForTest(t),
+	}
+	src := netip.MustParseAddr("10.0.0.5")
+	dst := net.Destination{
+		Network: net.Network_TCP,
+		Address: net.ParseAddress("1.2.3.4"),
+		Port:    net.Port(443),
+	}
+	conn := newFakeConn("1.2.3.4", 443)
+	h.virtualNetworkConnHandler()(src, dst, conn)
+
+	if got := len(disp.sniff); got != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", got)
+	}
+	sniff := disp.sniff[0]
+	if !sniff.Enabled {
+		t.Errorf("SniffingRequest.Enabled = false, want true")
+	}
+	if !sniff.RouteOnly {
+		t.Errorf("SniffingRequest.RouteOnly = false, want true (otherwise the sniffer overrides Target and undoes the gateway-IP rewrite)")
+	}
+	wantProtos := map[string]bool{"http": true, "tls": true}
+	for _, p := range sniff.OverrideDestinationForProtocol {
+		delete(wantProtos, p)
+	}
+	if len(wantProtos) != 0 {
+		t.Errorf("OverrideDestinationForProtocol missing %v, got %v", wantProtos, sniff.OverrideDestinationForProtocol)
 	}
 }
 

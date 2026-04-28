@@ -280,16 +280,27 @@ func (h *Handler) virtualNetworkConnHandler() virtualnet.ConnHandler {
 			}
 		}
 		ctx = session.ContextWithInbound(ctx, inbound)
-		// Always enable HTTP+TLS sniffing for virtualnet sub-flows so
+		// Enable HTTP+TLS sniffing for virtualnet sub-flows so that
 		// server-side routing rules that key on domain (including
-		// geosite:*) behave the same as they would for a classic VLESS
-		// inbound with sniffing configured. MetadataOnly=false because
-		// we are already decrypting the TCP payload at the gVisor
-		// stack — inspecting the first bytes is free.
+		// geosite:*) match the same way they would for a classic
+		// VLESS inbound with sniffing configured. We force RouteOnly
+		// because:
+		//   1. We already wrote the dispatch destination explicitly
+		//      (potentially rewritten from gateway-IP to loopback
+		//      below). If the sniffer was allowed to override the
+		//      destination, an HTTP `Host: 10.0.0.1` header would
+		//      yank Target back to 10.0.0.1, undoing the rewrite,
+		//      and freedom would dial an unreachable address.
+		//   2. For non-gateway flows, the L3 client already picked
+		//      a real destination IP — re-dialing by sniffed domain
+		//      would force a server-side DNS lookup that the user
+		//      did not ask for. RouteOnly keeps domain-based routing
+		//      working without surprising DNS behaviour.
 		ctx = session.ContextWithContent(ctx, &session.Content{
 			SniffingRequest: session.SniffingRequest{
 				Enabled:                        true,
 				OverrideDestinationForProtocol: []string{"http", "tls"},
+				RouteOnly:                      true,
 			},
 		})
 
