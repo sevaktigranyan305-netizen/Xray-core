@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -94,6 +95,16 @@ type Handler struct {
 	// only when the inbound config sets virtualNetwork.enabled=true.
 	// When nil all code paths behave exactly as vanilla VLESS.
 	vnet *virtualnet.Switch
+
+	// inboundTag holds this VLESS inbound's user-facing tag (e.g.
+	// "inbound-443" emitted by 3x-ui). Captured on the first Process
+	// call from session.InboundFromContext, then read by the
+	// virtualnet ConnHandler so synthesised L3 sub-flows route as if
+	// they originated from this inbound — without it, routing rules
+	// keyed on inboundTag (or balancer rules referencing them) never
+	// match for L3 traffic and silently fall through to the default
+	// outbound. atomic.Pointer to make the read/write race-free.
+	inboundTag atomic.Pointer[string]
 }
 
 // New creates a new VLess inbound handler.
@@ -240,13 +251,16 @@ func (h *Handler) virtualNetworkConnHandler() virtualnet.ConnHandler {
 		inbound := &session.Inbound{
 			Name:   "vless",
 			Source: net.DestinationFromAddr(conn.RemoteAddr()),
-			// Gateway / Tag are filled in by xray proxyman before
-			// Process is called normally; for synthesised sub-flows we
-			// don't know the inbound tag here so callers that key
-			// rules on inboundTag should rely on the original VLESS
-			// inbound tag via routing's context propagation. Setting
-			// Source to the virtual IP is the critical bit for the
-			// per-user sourceIP rules in the task.
+		}
+		// Propagate the original VLESS inbound's Tag onto the
+		// synthesised sub-flow so user-defined routing rules that key
+		// on inboundTag (e.g. {"inboundTag":["inbound-443"], ...}
+		// emitted by 3x-ui) match for L3 traffic. Without this, every
+		// L3 sub-flow surfaces with an empty tag and falls through to
+		// the default outbound regardless of how the inbound is
+		// referenced in routing rules or balancers.
+		if tagPtr := h.inboundTag.Load(); tagPtr != nil {
+			inbound.Tag = *tagPtr
 		}
 		// Overwrite Source with the user's virtual IP so that routing
 		// rules referencing sourceIP match the virtual network
@@ -813,6 +827,16 @@ func (h *Handler) serveVirtualNetwork(
 			Network: net.Network_TCP,
 			Address: net.IPAddress(ip.AsSlice()),
 			Port:    0,
+		}
+		// Capture the inbound tag for use by virtualNetworkConnHandler.
+		// proxyman fills inbound.Tag on the first Process invocation;
+		// the synthesised sub-flow ConnHandler runs in goroutines that
+		// don't see this ctx, so we stash the tag on the Handler the
+		// first time we observe it. All Process calls for the same
+		// inbound see the same tag, so racing Stores are idempotent.
+		if inbound.Tag != "" && h.inboundTag.Load() == nil {
+			tag := inbound.Tag
+			h.inboundTag.Store(&tag)
 		}
 	}
 
