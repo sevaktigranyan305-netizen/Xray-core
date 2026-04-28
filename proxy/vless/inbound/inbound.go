@@ -293,14 +293,34 @@ func (h *Handler) virtualNetworkConnHandler() virtualnet.ConnHandler {
 			},
 		})
 
+		// Gateway-IP rewrite: if the user addressed the virtual
+		// gateway directly (e.g. `curl http://10.0.0.1:4747` to reach
+		// a service that listens on 0.0.0.0 on the VPS host), the
+		// gVisor stack accepted the TCP/UDP handshake on the gateway
+		// address — but the dispatcher would otherwise hand 10.0.0.1
+		// to the freedom outbound, which would then dial 10.0.0.1
+		// over the host network where no real interface owns that IP
+		// and the connection collapses with "empty reply from server".
+		// Rewriting to 127.0.0.1 here makes the gateway IP semantically
+		// equivalent to "the host running xray", which matches what
+		// users coming from a WireGuard background expect.
+		dispatchDst := dst
+		if dispatchDst.Address.Family().IsIP() && h.vnet != nil {
+			if hostIP, ok := netip.AddrFromSlice(dispatchDst.Address.IP()); ok {
+				if hostIP.Unmap() == h.vnet.Gateway() {
+					dispatchDst.Address = net.LocalHostIP
+				}
+			}
+		}
+
 		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 			From:   inbound.Source,
-			To:     dst,
+			To:     dispatchDst,
 			Status: log.AccessAccepted,
 			Reason: "virtualnet",
 		})
 
-		if err := h.defaultDispatcher.DispatchLink(ctx, dst, &transport.Link{
+		if err := h.defaultDispatcher.DispatchLink(ctx, dispatchDst, &transport.Link{
 			Reader: buf.NewReader(conn),
 			Writer: buf.NewWriter(conn),
 		}); err != nil {
