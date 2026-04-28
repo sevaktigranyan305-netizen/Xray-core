@@ -156,6 +156,98 @@ func TestVirtualNetworkConnHandlerEmptyTagWhenUnset(t *testing.T) {
 	}
 }
 
+// TestVirtualNetworkConnHandlerRewritesGatewayDestToLoopback verifies
+// the bug fix where flows addressed to the virtual gateway IP (e.g.
+// curl http://10.0.0.1:4747 to reach a service listening on the VPS
+// host) used to be dispatched with the literal gateway IP, which the
+// freedom outbound then dialed over the host network where no real
+// interface owns it. With the fix the dispatcher receives 127.0.0.1
+// so the dial lands on the host's loopback and reaches services
+// bound to 0.0.0.0.
+func TestVirtualNetworkConnHandlerRewritesGatewayDestToLoopback(t *testing.T) {
+	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
+		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("NewSwitch: %v", err)
+	}
+	defer sw.Close()
+
+	disp := &captureDispatcher{}
+	h := &Handler{
+		defaultDispatcher: disp,
+		validator:         new(vless.MemoryValidator),
+		vnet:              sw,
+		ctx:               xrayCtxForTest(t),
+	}
+
+	src := netip.MustParseAddr("10.0.0.42")
+	dst := net.Destination{
+		Network: net.Network_TCP,
+		Address: net.ParseAddress("10.0.0.1"),
+		Port:    net.Port(4747),
+	}
+	conn := newFakeConn("10.0.0.1", 4747)
+	h.virtualNetworkConnHandler()(src, dst, conn)
+
+	if got := len(disp.dst); got != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", got)
+	}
+	if got, want := disp.dst[0].Address.String(), "127.0.0.1"; got != want {
+		t.Errorf("rewritten dst.Address = %q, want %q", got, want)
+	}
+	if got, want := uint16(disp.dst[0].Port), uint16(4747); got != want {
+		t.Errorf("dst.Port = %d, want %d (port must be preserved)", got, want)
+	}
+}
+
+// TestVirtualNetworkConnHandlerLeavesNonGatewayDestUntouched pins the
+// scope of the gateway-IP rewrite so that future refactors can't widen
+// it to peer or external addresses by accident.
+func TestVirtualNetworkConnHandlerLeavesNonGatewayDestUntouched(t *testing.T) {
+	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
+		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("NewSwitch: %v", err)
+	}
+	defer sw.Close()
+
+	cases := []struct {
+		name string
+		ip   string
+	}{
+		{"peer in subnet", "10.0.0.42"},
+		{"external IPv4", "8.8.8.8"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			disp := &captureDispatcher{}
+			h := &Handler{
+				defaultDispatcher: disp,
+				validator:         new(vless.MemoryValidator),
+				vnet:              sw,
+				ctx:               xrayCtxForTest(t),
+			}
+			src := netip.MustParseAddr("10.0.0.99")
+			dst := net.Destination{
+				Network: net.Network_TCP,
+				Address: net.ParseAddress(tc.ip),
+				Port:    net.Port(80),
+			}
+			conn := newFakeConn(tc.ip, 80)
+			h.virtualNetworkConnHandler()(src, dst, conn)
+
+			if got := len(disp.dst); got != 1 {
+				t.Fatalf("expected 1 dispatch, got %d", got)
+			}
+			if got := disp.dst[0].Address.String(); got != tc.ip {
+				t.Errorf("dst.Address = %q, want %q (must not be rewritten)", got, tc.ip)
+			}
+		})
+	}
+}
+
 // TestInboundTagAtomicStoreLoad documents the lock-free read/write
 // contract used by serveVirtualNetwork (writer) and
 // virtualNetworkConnHandler (reader). It exists so that anyone who
