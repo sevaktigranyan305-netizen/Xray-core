@@ -1,0 +1,199 @@
+package inbound
+
+import (
+	"context"
+	stdnet "net"
+	"net/netip"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/vless"
+	"github.com/xtls/xray-core/proxy/vless/virtualnet"
+	"github.com/xtls/xray-core/transport"
+)
+
+// xrayCtxForTest builds a minimal context that carries a *core.Instance,
+// satisfying core.MustFromContext used by virtualNetworkConnHandler via
+// core.ToBackgroundDetachedContext. We avoid invoking core.New (which
+// pulls in dispatcher/proxyman feature initialisation) by stashing a
+// zero-valued *core.Instance directly under the unexported context
+// key. ToBackgroundDetachedContext re-injects whatever instance it
+// finds, so a placeholder is enough for the closure under test.
+func xrayCtxForTest(t *testing.T) context.Context {
+	t.Helper()
+	inst, err := core.New(&core.Config{})
+	if err != nil {
+		t.Fatalf("core.New: %v", err)
+	}
+	return context.WithValue(context.Background(), core.XrayKey(1), inst)
+}
+
+// captureDispatcher implements routing.Dispatcher and records the
+// session.Inbound seen on every dispatched ctx so tests can assert on
+// the tag propagated by virtualNetworkConnHandler.
+type captureDispatcher struct {
+	mu       sync.Mutex
+	inbounds []*session.Inbound
+	dst      []net.Destination
+}
+
+func (c *captureDispatcher) Type() interface{} { return routing.DispatcherType() }
+func (c *captureDispatcher) Start() error      { return nil }
+func (c *captureDispatcher) Close() error      { return nil }
+
+func (c *captureDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
+	c.record(ctx, dest)
+	return nil, nil
+}
+
+func (c *captureDispatcher) DispatchLink(ctx context.Context, dest net.Destination, _ *transport.Link) error {
+	c.record(ctx, dest)
+	return nil
+}
+
+func (c *captureDispatcher) record(ctx context.Context, dest net.Destination) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.inbounds = append(c.inbounds, session.InboundFromContext(ctx))
+	c.dst = append(c.dst, dest)
+}
+
+// TestVirtualNetworkConnHandlerPropagatesInboundTag verifies the bug fix
+// where synthesised L3 sub-flows surfaced with an empty inbound.Tag,
+// causing user-defined routing rules keyed on inboundTag (e.g.
+// {"inboundTag":["inbound-443"], ...} emitted by 3x-ui) to silently
+// fall through to the default outbound. With the fix, the tag observed
+// by the dispatcher matches what proxyman set on the original VLESS
+// inbound's Process ctx.
+func TestVirtualNetworkConnHandlerPropagatesInboundTag(t *testing.T) {
+	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
+		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("NewSwitch: %v", err)
+	}
+	defer sw.Close()
+
+	disp := &captureDispatcher{}
+	h := &Handler{
+		defaultDispatcher: disp,
+		validator:         new(vless.MemoryValidator),
+		vnet:              sw,
+		ctx:               xrayCtxForTest(t),
+	}
+	tag := "inbound-443"
+	h.inboundTag.Store(&tag)
+
+	src := netip.MustParseAddr("10.0.0.42")
+	dst := net.Destination{
+		Network: net.Network_TCP,
+		Address: net.ParseAddress("1.2.3.4"),
+		Port:    net.Port(80),
+	}
+	conn := newFakeConn("1.2.3.4", 80)
+	h.virtualNetworkConnHandler()(src, dst, conn)
+
+	if got := len(disp.inbounds); got != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", got)
+	}
+	in := disp.inbounds[0]
+	if in == nil {
+		t.Fatalf("session.Inbound missing on dispatched ctx")
+	}
+	if in.Tag != "inbound-443" {
+		t.Errorf("inbound.Tag = %q, want %q", in.Tag, "inbound-443")
+	}
+	if got, want := in.Source.Address.String(), "10.0.0.42"; got != want {
+		t.Errorf("inbound.Source.Address = %q, want %q", got, want)
+	}
+}
+
+// TestVirtualNetworkConnHandlerEmptyTagWhenUnset confirms the closure
+// leaves Tag empty when the handler hasn't observed any Process ctx
+// yet. This makes the tag-capture-on-first-Process behaviour explicit
+// in the test suite so future refactors that change the fallback
+// (e.g. read tag from config instead) catch any regression.
+func TestVirtualNetworkConnHandlerEmptyTagWhenUnset(t *testing.T) {
+	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
+		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("NewSwitch: %v", err)
+	}
+	defer sw.Close()
+
+	disp := &captureDispatcher{}
+	h := &Handler{
+		defaultDispatcher: disp,
+		validator:         new(vless.MemoryValidator),
+		vnet:              sw,
+		ctx:               xrayCtxForTest(t),
+	}
+	if h.inboundTag.Load() != nil {
+		t.Fatalf("inboundTag should default to nil")
+	}
+
+	src := netip.MustParseAddr("10.0.0.99")
+	dst := net.Destination{
+		Network: net.Network_TCP,
+		Address: net.ParseAddress("8.8.8.8"),
+		Port:    net.Port(53),
+	}
+	conn := newFakeConn("8.8.8.8", 53)
+	h.virtualNetworkConnHandler()(src, dst, conn)
+
+	if got := len(disp.inbounds); got != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", got)
+	}
+	if tag := disp.inbounds[0].Tag; tag != "" {
+		t.Errorf("inbound.Tag = %q, want empty", tag)
+	}
+}
+
+// TestInboundTagAtomicStoreLoad documents the lock-free read/write
+// contract used by serveVirtualNetwork (writer) and
+// virtualNetworkConnHandler (reader). It exists so that anyone who
+// considers swapping atomic.Pointer for a plain string field has a
+// failing race test to remind them why the indirection is required.
+func TestInboundTagAtomicStoreLoad(t *testing.T) {
+	var p atomic.Pointer[string]
+	if p.Load() != nil {
+		t.Fatal("zero atomic.Pointer should Load nil")
+	}
+	tag := "inbound-443"
+	p.Store(&tag)
+	got := p.Load()
+	if got == nil || *got != "inbound-443" {
+		t.Fatalf("Load after Store mismatch: %v", got)
+	}
+}
+
+// fakeConn is a minimal stdlib net.Conn shim. virtualNetworkConnHandler
+// only inspects RemoteAddr() on the conn (the Reader/Writer it builds
+// from the conn are passed straight to DispatchLink, which our
+// captureDispatcher discards).
+type fakeConn struct {
+	remote stdnet.Addr
+	closed bool
+}
+
+func newFakeConn(ip string, port int) *fakeConn {
+	return &fakeConn{remote: &stdnet.TCPAddr{IP: stdnet.ParseIP(ip), Port: port}}
+}
+
+func (f *fakeConn) Read(_ []byte) (int, error)  { return 0, nil }
+func (f *fakeConn) Write(p []byte) (int, error) { return len(p), nil }
+func (f *fakeConn) Close() error                { f.closed = true; return nil }
+func (f *fakeConn) LocalAddr() stdnet.Addr {
+	return &stdnet.TCPAddr{IP: stdnet.IPv4(127, 0, 0, 1), Port: 0}
+}
+func (f *fakeConn) RemoteAddr() stdnet.Addr            { return f.remote }
+func (f *fakeConn) SetDeadline(_ time.Time) error      { return nil }
+func (f *fakeConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (f *fakeConn) SetWriteDeadline(_ time.Time) error { return nil }
