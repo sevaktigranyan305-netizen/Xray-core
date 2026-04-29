@@ -54,8 +54,21 @@ func newDevice(cfg deviceConfig) (Device, error) {
 		return nil, fmt.Errorf("l3client: invalid %s value %q", platform.TunFdKey, fdStr)
 	}
 
-	if err := unix.SetNonblock(fd, true); err != nil {
-		return nil, fmt.Errorf("l3client: SetNonblock(%d): %w", fd, err)
+	// Dup the fd so wireguard/tun can manage its own lifecycle without
+	// closing the VpnService-owned original. wireguard/tun.NativeTun.Close
+	// calls tunFile.Close() on the *os.File it constructs, which will close
+	// the underlying integer fd. VpnService also closes the same integer on
+	// revoke()/stopSelf(); closing the same numeric fd twice (once via our
+	// dup, once via the framework) is racy because the kernel may have
+	// reassigned that integer to an unrelated open() in between. Dup gives
+	// us an independent kernel reference whose lifetime we own.
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return nil, fmt.Errorf("l3client: Dup(%d): %w", fd, err)
+	}
+	if err := unix.SetNonblock(dup, true); err != nil {
+		_ = unix.Close(dup)
+		return nil, fmt.Errorf("l3client: SetNonblock(%d): %w", dup, err)
 	}
 
 	mtu := cfg.MTU
@@ -63,9 +76,10 @@ func newDevice(cfg deviceConfig) (Device, error) {
 		mtu = MTU
 	}
 
-	tun, name, err := wgtun.CreateUnmonitoredTUNFromFD(fd)
+	tun, name, err := wgtun.CreateUnmonitoredTUNFromFD(dup)
 	if err != nil {
-		return nil, fmt.Errorf("l3client: CreateUnmonitoredTUNFromFD(%d): %w", fd, err)
+		_ = unix.Close(dup)
+		return nil, fmt.Errorf("l3client: CreateUnmonitoredTUNFromFD(%d): %w", dup, err)
 	}
 
 	d := &androidDevice{
@@ -120,11 +134,12 @@ func (d *androidDevice) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close drops the wireguard/tun wrapper. The underlying VpnService fd is
-// owned by the Java side: revoke()/stopSelf() on the VpnService closes the
-// kernel TUN, which makes our outstanding Read return io.EOF and the
-// l3client retry loop reconnect cleanly. We deliberately do NOT close the
-// raw fd ourselves to avoid double-close races with VpnService.
+// Close releases the dup'd fd and tears down the wireguard/tun wrapper.
+// The original VpnService fd remains owned by the Java side; revoke() /
+// stopSelf() on the VpnService closes that one independently. By
+// duplicating the fd in newDevice we guarantee that closing the wireguard/
+// tun side has no effect on the VpnService's reference, so there is no
+// double-close race even if both happen concurrently.
 func (d *androidDevice) Close() error {
 	return d.tun.Close()
 }
