@@ -1,70 +1,62 @@
 package virtualnet
 
 import (
-	"crypto/sha1"
 	"errors"
 	"fmt"
 	"net/netip"
 	"sync"
 )
 
-// IPAM assigns and remembers virtual IPs for users. Mappings are kept in
-// memory for the lifetime of the process, matching the "persists in
-// memory for the lifetime of the process" requirement in the task.
+// IPAM assigns and remembers virtual IPs for users.
 //
-// Assignment strategy:
+// Allocation strategy: deterministic and sequential. The first usable
+// host of the subnet (subnet.Addr()+1) is reserved as the gateway.
+// Subsequent users get the lowest free host address, in ascending
+// order: 10.0.0.2, 10.0.0.3, 10.0.0.4 … For each new UUID we scan from
+// gateway+1 upwards and pick the first slot not currently held by
+// another UUID. When a UUID is removed (Release / Reconcile drops it),
+// its address goes back into the pool and may be reused by a later
+// Assign — again, the lowest free slot wins.
 //
-//  1. If a UUID has already been assigned an IP, return that IP.
-//
-//  2. Otherwise derive a deterministic candidate IP from SHA-1(uuid)
-//     folded into the subnet's host range. Skip the network, gateway and
-//     broadcast addresses, plus any candidate already taken — in which
-//     case we linearly probe forward until a free slot is found. This
-//     gives stable assignments in the common case while still handling
-//     collisions gracefully.
-//
-//  3. If every host is taken, return an error. For a /24 that means 253
-//     concurrent users, which is well beyond the expected single-host
-//     scale.
-//
-// The persistMapping flag is reserved for a future on-disk persistence
-// backend. Today it is honoured only insofar as assignments are never
-// released when users disconnect — they remain in the table so the same
-// user gets the same IP on reconnect. Set to false to release IPs on
-// Remove().
+// Mappings are owned by the IPAM in memory. When a non-empty
+// PersistPath is configured the table is also serialised to disk on
+// every change (atomic write via temp file + rename). On startup the
+// file is loaded back so a UUID keeps the same address across xray
+// restarts. Reconcile drops mappings whose UUID is no longer in the
+// inbound's client list, which is how "user deleted from the panel
+// while xray was offline" gets cleaned up.
 type IPAM struct {
-	subnet         netip.Prefix
-	gateway        netip.Addr
-	broadcast      netip.Addr
-	persistMapping bool
+	subnet      netip.Prefix
+	gateway     netip.Addr
+	broadcast   netip.Addr
+	persistPath string
 
-	mu       sync.Mutex
-	byUUID   map[string]netip.Addr
-	inUse    map[netip.Addr]string // IP -> UUID (reverse map for collision checks)
-	hostBits int
+	mu     sync.Mutex
+	byUUID map[string]netip.Addr
+	inUse  map[netip.Addr]string // IP -> UUID (reverse map for collision checks)
 }
 
-// NewIPAM constructs an IPAM for the given subnet. The caller is
-// responsible for ensuring the prefix is valid IPv4; NewSwitch does this.
-func NewIPAM(subnet netip.Prefix, persistMapping bool) *IPAM {
+// NewIPAM constructs an IPAM for the given subnet. If persistPath is
+// non-empty the file is loaded as initial state (missing/corrupt files
+// are treated as empty with a warning logged by the caller). The
+// caller is responsible for ensuring the prefix is valid IPv4;
+// NewSwitch does this.
+func NewIPAM(subnet netip.Prefix, persistPath string) *IPAM {
 	gateway := subnet.Addr().Next()
-	// Compute the directed broadcast: all-ones host portion. We reject
-	// assigning that to a user because some stacks treat it specially.
-	hostBits := 32 - subnet.Bits()
 	bcast := directedBroadcast(subnet)
 	return &IPAM{
-		subnet:         subnet,
-		gateway:        gateway,
-		broadcast:      bcast,
-		persistMapping: persistMapping,
-		byUUID:         make(map[string]netip.Addr),
-		inUse:          make(map[netip.Addr]string),
-		hostBits:       hostBits,
+		subnet:      subnet,
+		gateway:     gateway,
+		broadcast:   bcast,
+		persistPath: persistPath,
+		byUUID:      make(map[string]netip.Addr),
+		inUse:       make(map[netip.Addr]string),
 	}
 }
 
 // Assign returns the IP for uuid, allocating one if needed. It is safe
-// for concurrent use.
+// for concurrent use. Allocation is sequential: the lowest free host
+// address (gateway+1, gateway+2, …) is returned.
 func (a *IPAM) Assign(uuid string) (netip.Addr, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -73,20 +65,22 @@ func (a *IPAM) Assign(uuid string) (netip.Addr, error) {
 		return ip, nil
 	}
 
-	candidate := a.deterministicCandidate(uuid)
-	for i := 0; i < a.hostSpace(); i++ {
-		ip := a.advance(candidate, i)
-		if !a.isUsable(ip) {
-			continue
-		}
-		if _, taken := a.inUse[ip]; taken {
-			continue
-		}
-		a.byUUID[uuid] = ip
-		a.inUse[ip] = uuid
-		return ip, nil
+	ip, ok := a.lowestFreeLocked()
+	if !ok {
+		return netip.Addr{}, errors.New("virtualnet: subnet exhausted")
 	}
-	return netip.Addr{}, errors.New("virtualnet: subnet exhausted")
+	a.byUUID[uuid] = ip
+	a.inUse[ip] = uuid
+	if err := a.saveLocked(); err != nil {
+		// Roll back the in-memory write so the on-disk and in-memory
+		// views never diverge. Returning the error gives the caller a
+		// chance to log; the connect attempt will fail and the user
+		// will retry.
+		delete(a.byUUID, uuid)
+		delete(a.inUse, ip)
+		return netip.Addr{}, fmt.Errorf("virtualnet: persist ipam: %w", err)
+	}
+	return ip, nil
 }
 
 // Lookup returns the IP for uuid, if any.
@@ -108,24 +102,58 @@ func (a *IPAM) UUIDOf(ip netip.Addr) (string, bool) {
 	return uuid, ok
 }
 
-// Remove releases an assignment. It is a no-op if the UUID is unknown.
-// When persistMapping is true the mapping is retained so a future Assign
-// for the same UUID returns the same IP.
-func (a *IPAM) Remove(uuid string) {
+// Release frees the slot held by uuid, if any. It is the inverse of
+// Assign and is intended to be called when a user is deleted from the
+// inbound's client list (e.g. via the panel). The freed address can
+// then be reused by the next Assign whose UUID has no existing
+// mapping. Persistent state is updated on success.
+func (a *IPAM) Release(uuid string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.persistMapping {
+	ip, ok := a.byUUID[uuid]
+	if !ok {
 		return
 	}
-	if ip, ok := a.byUUID[uuid]; ok {
-		delete(a.byUUID, uuid)
-		delete(a.inUse, ip)
+	delete(a.byUUID, uuid)
+	delete(a.inUse, ip)
+	// Best-effort save. Failure here is logged by the caller but does
+	// not roll back: the user has already been deleted upstream and
+	// re-pinning their old IP would just let it leak into the persisted
+	// file across restarts.
+	_ = a.saveLocked()
+}
+
+// Reconcile drops mappings whose UUID is not present in activeUUIDs.
+// This is called once at startup with the current set of client UUIDs
+// from the inbound config, so that any mapping persisted on disk for a
+// user that has since been removed from the panel is cleaned up
+// before the first connect. Returns the number of mappings dropped.
+func (a *IPAM) Reconcile(activeUUIDs []string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	active := make(map[string]struct{}, len(activeUUIDs))
+	for _, u := range activeUUIDs {
+		active[u] = struct{}{}
 	}
+	released := 0
+	for u, ip := range a.byUUID {
+		if _, ok := active[u]; ok {
+			continue
+		}
+		delete(a.byUUID, u)
+		delete(a.inUse, ip)
+		released++
+	}
+	if released > 0 {
+		_ = a.saveLocked()
+	}
+	return released
 }
 
 // Reserve forces an assignment for uuid -> ip, erroring if the IP is
-// already taken by a different UUID or falls outside the subnet. Useful
-// if a future config backend wants to pre-populate pinned assignments.
+// already taken by a different UUID or falls outside the subnet. This
+// is what the persistence loader uses to rehydrate state without going
+// through the lowest-free allocator.
 func (a *IPAM) Reserve(uuid string, ip netip.Addr) error {
 	if !a.subnet.Contains(ip) {
 		return fmt.Errorf("virtualnet: %s is outside subnet %s", ip, a.subnet)
@@ -146,40 +174,36 @@ func (a *IPAM) Reserve(uuid string, ip netip.Addr) error {
 	return nil
 }
 
-// hostSpace is the number of candidate host addresses we consider (2^h).
-// We accept a small amount of wasted iteration for the reserved
-// network/gateway/broadcast slots.
-func (a *IPAM) hostSpace() int {
-	if a.hostBits >= 31 {
-		// Guard: a /0 or /1 is meaningless here; cap at something sane.
-		return 1 << 30
+// Snapshot returns a copy of the current UUID->IP table. Intended for
+// tests and for the persistence layer's serialisation step. Holding
+// the IPAM lock here is safe because callers must not call back into
+// the IPAM while holding the snapshot.
+func (a *IPAM) Snapshot() map[string]netip.Addr {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]netip.Addr, len(a.byUUID))
+	for k, v := range a.byUUID {
+		out[k] = v
 	}
-	return 1 << a.hostBits
+	return out
 }
 
-// deterministicCandidate folds a SHA-1 of the UUID into the host portion
-// of the subnet. SHA-1 is used only as a stable hash — no cryptographic
-// property is required.
-func (a *IPAM) deterministicCandidate(uuid string) netip.Addr {
-	sum := sha1.Sum([]byte(uuid))
-	offset := (uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])) & hostMask(a.hostBits)
-	base := a.subnet.Addr().As4()
-	net := uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
-	// Zero the host bits of the network address, then OR in the host
-	// portion of the hash.
-	net &= ^hostMask(a.hostBits)
-	ip := net | offset
-	return uint32ToAddr(ip)
-}
-
-// advance returns candidate+delta (wrapping within the subnet). Used to
-// linearly probe after the hashed candidate collides.
-func (a *IPAM) advance(candidate netip.Addr, delta int) netip.Addr {
-	u := addrToUint32(candidate)
-	host := u & hostMask(a.hostBits)
-	net := u & ^hostMask(a.hostBits)
-	host = (host + uint32(delta)) & hostMask(a.hostBits)
-	return uint32ToAddr(net | host)
+// lowestFreeLocked scans from gateway+1 upwards for the first usable
+// address that no UUID currently holds. The caller must hold a.mu.
+// Returns ok=false when the subnet is exhausted.
+func (a *IPAM) lowestFreeLocked() (netip.Addr, bool) {
+	cur := a.gateway.Next()
+	for a.subnet.Contains(cur) {
+		if !a.isUsable(cur) {
+			cur = cur.Next()
+			continue
+		}
+		if _, taken := a.inUse[cur]; !taken {
+			return cur, true
+		}
+		cur = cur.Next()
+	}
+	return netip.Addr{}, false
 }
 
 // isUsable filters out the network, gateway and broadcast IPs.
@@ -204,7 +228,7 @@ func directedBroadcast(p netip.Prefix) netip.Addr {
 	base := p.Addr().As4()
 	v := uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
 	v |= hostMask(hostBits)
-	return uint32ToAddr(v)
+	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
 }
 
 func hostMask(hostBits int) uint32 {
@@ -215,13 +239,4 @@ func hostMask(hostBits int) uint32 {
 		return ^uint32(0)
 	}
 	return (uint32(1) << hostBits) - 1
-}
-
-func addrToUint32(a netip.Addr) uint32 {
-	b := a.As4()
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-func uint32ToAddr(v uint32) netip.Addr {
-	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
 }

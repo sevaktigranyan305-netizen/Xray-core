@@ -30,13 +30,15 @@ type VLessInboundFallback struct {
 }
 
 // VLessInboundVirtualNetwork mirrors proto VirtualNetwork for JSON parsing.
-// Use a pointer to *bool for PersistMapping so absence is distinguishable
-// from an explicit false — this lets the handler default it to true when
-// unset.
 type VLessInboundVirtualNetwork struct {
-	Enabled        bool   `json:"enabled"`
-	Subnet         string `json:"subnet"`
-	PersistMapping *bool  `json:"persistMapping"`
+	Enabled bool   `json:"enabled"`
+	Subnet  string `json:"subnet"`
+	// PersistMapping is accepted for backward compatibility with
+	// older configs but is ignored — IPAM mappings are now always
+	// persisted to disk so a UUID keeps the same virtual IP across
+	// restarts. Free slots from deleted users are reused on a
+	// lowest-free-first basis.
+	PersistMapping *bool `json:"persistMapping,omitempty"`
 }
 
 type VLessInboundConfig struct {
@@ -211,18 +213,11 @@ func (c *VLessInboundConfig) Build() (proto.Message, error) {
 	}
 
 	if c.VirtualNetwork != nil {
-		vn := &inbound.VirtualNetwork{
+		// PersistMapping is read but ignored — see the field comment.
+		config.VirtualNetwork = &inbound.VirtualNetwork{
 			Enabled: c.VirtualNetwork.Enabled,
 			Subnet:  c.VirtualNetwork.Subnet,
 		}
-		if c.VirtualNetwork.PersistMapping != nil {
-			vn.PersistMapping = *c.VirtualNetwork.PersistMapping
-		} else {
-			// Unset in JSON: default to true. This matches the task
-			// which implies persistence is the expected behaviour.
-			vn.PersistMapping = true
-		}
-		config.VirtualNetwork = vn
 	}
 
 	return config, nil

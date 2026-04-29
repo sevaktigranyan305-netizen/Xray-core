@@ -85,10 +85,11 @@ type Config struct {
 	// gateway that gVisor binds to.
 	Subnet netip.Prefix
 
-	// PersistMapping keeps UUID->IP assignments stable for the lifetime
-	// of the process. When false the IPAM still persists mappings in
-	// memory — the flag only affects future persistence backends.
-	PersistMapping bool
+	// PersistPath is an absolute filesystem path where the IPAM table
+	// (UUID -> assigned IP) is mirrored. Empty means in-memory only,
+	// which is what tests use; production callers always set this so
+	// assignments survive xray restart.
+	PersistPath string
 
 	// MTU of the virtual TUN. Zero means defaultMTU.
 	MTU int
@@ -132,7 +133,7 @@ func NewSwitch(parent context.Context, cfg Config) (*Switch, error) {
 	sw := &Switch{
 		subnet:    cfg.Subnet,
 		gatewayIP: gateway,
-		ipam:      NewIPAM(cfg.Subnet, cfg.PersistMapping),
+		ipam:      NewIPAM(cfg.Subnet, cfg.PersistPath),
 		endpoints: make(map[netip.Addr]*Endpoint),
 		tunDev:    dev,
 		gNet:      gnet,

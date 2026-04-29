@@ -29,6 +29,23 @@ type MemoryValidator struct {
 	// Considering email's usage here, map + sync.Mutex/RWMutex may have better performance.
 	email sync.Map
 	users sync.Map
+
+	// onDel, if set, is invoked synchronously inside Del for the
+	// MemoryUser that is about to be removed. The virtualnet IPAM
+	// uses this to release a deleted user's pinned virtual IP back
+	// into the pool. Called while no lock is held; the callback must
+	// not call back into this validator.
+	onDelMu sync.RWMutex
+	onDel   func(*protocol.MemoryUser)
+}
+
+// SetOnDel registers a callback fired by Del with the user that is
+// about to be removed. Passing nil clears the hook. Safe for
+// concurrent use.
+func (v *MemoryValidator) SetOnDel(fn func(*protocol.MemoryUser)) {
+	v.onDelMu.Lock()
+	defer v.onDelMu.Unlock()
+	v.onDel = fn
 }
 
 // Add a VLESS user, Email must be empty or unique.
@@ -53,8 +70,15 @@ func (v *MemoryValidator) Del(e string) error {
 	if u == nil {
 		return errors.New("User ", e, " not found.")
 	}
+	mu := u.(*protocol.MemoryUser)
 	v.email.Delete(le)
-	v.users.Delete(ProcessUUID(u.(*protocol.MemoryUser).Account.(*MemoryAccount).ID.UUID()))
+	v.users.Delete(ProcessUUID(mu.Account.(*MemoryAccount).ID.UUID()))
+	v.onDelMu.RLock()
+	hook := v.onDel
+	v.onDelMu.RUnlock()
+	if hook != nil {
+		hook(mu)
+	}
 	return nil
 }
 
