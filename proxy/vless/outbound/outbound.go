@@ -152,7 +152,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	handler.testpre = a.Testpre
 
 	if vn := config.VirtualNetwork; vn != nil && vn.Enabled {
-		errors.LogInfo(ctx, "virtualNetwork: activating L3 client (subnet=", vn.Subnet, ", interfaceName=", vn.InterfaceName, ", mtu=", vn.Mtu, ", defaultRoute=", vn.DefaultRoute, ")")
+		errors.LogInfo(ctx, "virtualNetwork: activating L3 client (subnet=", vn.Subnet, ", interfaceName=", vn.InterfaceName, ", mtu=", vn.Mtu, ", defaultRoute=", vn.DefaultRoute, ", assignedIP=", vn.AssignedIp, ")")
 		subnetStr := vn.Subnet
 		if subnetStr == "" {
 			subnetStr = "10.0.0.0/24"
@@ -161,11 +161,20 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		if err != nil {
 			return nil, errors.New("invalid virtualNetwork.subnet: " + subnetStr).Base(err)
 		}
+		var assignedIP netip.Addr
+		if vn.AssignedIp != "" {
+			parsed, err := netip.ParseAddr(vn.AssignedIp)
+			if err != nil {
+				return nil, errors.New("invalid virtualNetwork.assignedIp: " + vn.AssignedIp).Base(err)
+			}
+			assignedIP = parsed
+		}
 		cli, err := l3client.NewClient(l3client.Config{
 			Subnet:        subnet,
 			InterfaceName: vn.InterfaceName,
 			MTU:           int(vn.Mtu),
 			DefaultRoute:  vn.DefaultRoute,
+			AssignedIP:    assignedIP,
 		})
 		if err != nil {
 			return nil, errors.New("virtualNetwork client").Base(err)

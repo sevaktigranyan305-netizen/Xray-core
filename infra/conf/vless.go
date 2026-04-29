@@ -260,6 +260,13 @@ type VLessOutboundVirtualNetwork struct {
 	InterfaceName string `json:"interfaceName"`
 	MTU           int32  `json:"mtu"`
 	DefaultRoute  bool   `json:"defaultRoute"`
+	// AssignedIP is the virtual IPv4 the panel pre-allocated for this
+	// user via the server-side IPAM. When set, the client uses it as
+	// the authoritative TUN address and validates that the server's
+	// preamble announces the same value. The JSON key matches the URL
+	// query name "vnetIp" so VLESS link parsers can pass it through
+	// unchanged.
+	AssignedIP string `json:"vnetIp"`
 }
 
 type VLessOutboundConfig struct {
@@ -410,6 +417,7 @@ func (c *VLessOutboundConfig) Build() (proto.Message, error) {
 			InterfaceName: c.VirtualNetwork.InterfaceName,
 			Mtu:           c.VirtualNetwork.MTU,
 			DefaultRoute:  c.VirtualNetwork.DefaultRoute,
+			AssignedIp:    c.VirtualNetwork.AssignedIP,
 		}
 	}
 

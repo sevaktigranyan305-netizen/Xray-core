@@ -30,6 +30,14 @@ message VirtualNetwork {
   // gateway to avoid a routing loop. When false (default), only the
   // virtual subnet is routed through the TUN.
   bool default_route = 5;
+  // AssignedIP, when set, is the virtual IPv4 the panel pre-allocated
+  // for this user via the server-side IPAM. When provided the client
+  // uses it as the authoritative TUN address and validates that the
+  // server's preamble announces the same value, failing loudly on
+  // mismatch. Required for android/windows where the host process
+  // configures the interface address before xray ever sees the file
+  // descriptor and there is no other way to keep them consistent.
+  string assigned_ip = 6;
 }
 
 message Config {
