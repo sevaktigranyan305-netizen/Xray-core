@@ -44,7 +44,15 @@ type VirtualNetwork struct {
 	// The server's real IP is automatically excluded via the underlay
 	// gateway to avoid a routing loop. When false (default), only the
 	// virtual subnet is routed through the TUN.
-	DefaultRoute  bool `protobuf:"varint,5,opt,name=default_route,json=defaultRoute,proto3" json:"default_route,omitempty"`
+	DefaultRoute bool `protobuf:"varint,5,opt,name=default_route,json=defaultRoute,proto3" json:"default_route,omitempty"`
+	// AssignedIP, when set, is the virtual IPv4 the panel pre-allocated
+	// for this user via the server-side IPAM. When provided the client
+	// uses it as the authoritative TUN address and validates that the
+	// server's preamble announces the same value, failing loudly on
+	// mismatch. Required for android/windows where the host process
+	// configures the interface address before xray ever sees the file
+	// descriptor and there is no other way to keep them consistent.
+	AssignedIp    string `protobuf:"bytes,6,opt,name=assigned_ip,json=assignedIp,proto3" json:"assigned_ip,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -114,6 +122,13 @@ func (x *VirtualNetwork) GetDefaultRoute() bool {
 	return false
 }
 
+func (x *VirtualNetwork) GetAssignedIp() string {
+	if x != nil {
+		return x.AssignedIp
+	}
+	return ""
+}
+
 type Config struct {
 	state          protoimpl.MessageState   `protogen:"open.v1"`
 	Vnext          *protocol.ServerEndpoint `protobuf:"bytes,1,opt,name=vnext,proto3" json:"vnext,omitempty"`
@@ -170,13 +185,15 @@ var File_proxy_vless_outbound_config_proto protoreflect.FileDescriptor
 
 const file_proxy_vless_outbound_config_proto_rawDesc = "" +
 	"\n" +
-	"!proxy/vless/outbound/config.proto\x12\x19xray.proxy.vless.outbound\x1a!common/protocol/server_spec.proto\"\xa0\x01\n" +
+	"!proxy/vless/outbound/config.proto\x12\x19xray.proxy.vless.outbound\x1a!common/protocol/server_spec.proto\"\xc1\x01\n" +
 	"\x0eVirtualNetwork\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12\x16\n" +
 	"\x06subnet\x18\x02 \x01(\tR\x06subnet\x12%\n" +
 	"\x0einterface_name\x18\x03 \x01(\tR\rinterfaceName\x12\x10\n" +
 	"\x03mtu\x18\x04 \x01(\x05R\x03mtu\x12#\n" +
-	"\rdefault_route\x18\x05 \x01(\bR\fdefaultRoute\"\x98\x01\n" +
+	"\rdefault_route\x18\x05 \x01(\bR\fdefaultRoute\x12\x1f\n" +
+	"\vassigned_ip\x18\x06 \x01(\tR\n" +
+	"assignedIp\"\x98\x01\n" +
 	"\x06Config\x12:\n" +
 	"\x05vnext\x18\x01 \x01(\v2$.xray.common.protocol.ServerEndpointR\x05vnext\x12R\n" +
 	"\x0fvirtual_network\x18\x02 \x01(\v2).xray.proxy.vless.outbound.VirtualNetworkR\x0evirtualNetworkBm\n" +

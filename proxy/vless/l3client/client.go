@@ -47,6 +47,20 @@ type Config struct {
 	// the resolved serverIP to install a /32 exclusion. When false,
 	// only the intra-tunnel subnet is routed through the TUN.
 	DefaultRoute bool
+
+	// AssignedIP, when set, is the virtual IPv4 the panel pre-allocated
+	// for this user via the server-side IPAM. When provided the client
+	// uses it as the authoritative TUN address and validates that the
+	// server's preamble announces the same value, returning a loud
+	// error on mismatch instead of silently mis-routing traffic.
+	//
+	// When unset (zero Addr) the client falls back to the legacy
+	// behaviour of trusting whatever IP the server preamble announces.
+	// Linux/darwin clients can run either way; android clients must
+	// always set this field because the host process configures the
+	// TUN interface address before xray ever sees the file descriptor
+	// and there is no other channel to keep the two views consistent.
+	AssignedIP netip.Addr
 }
 
 // ActivityUpdater is the subset of common/signal.ActivityTimer we need.
@@ -64,6 +78,14 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	if !cfg.Subnet.Addr().Is4() {
 		return nil, errors.New("l3client: Subnet must be IPv4")
+	}
+	if cfg.AssignedIP.IsValid() {
+		if !cfg.AssignedIP.Is4() {
+			return nil, errors.New("l3client: AssignedIP must be IPv4")
+		}
+		if !cfg.Subnet.Contains(cfg.AssignedIP) {
+			return nil, fmt.Errorf("l3client: AssignedIP %s is outside subnet %s", cfg.AssignedIP, cfg.Subnet)
+		}
 	}
 	return &Client{cfg: cfg}, nil
 }
@@ -85,6 +107,18 @@ func (c *Client) Run(ctx context.Context, stream io.ReadWriteCloser, activity Ac
 	ip := netip.AddrFrom4(ip4)
 	if !c.cfg.Subnet.Contains(ip) {
 		return fmt.Errorf("l3client: server announced %s outside subnet %s", ip, c.cfg.Subnet)
+	}
+	// When the panel has pre-allocated an IP for this user via the
+	// server-side IPAM and embedded it into the VLESS link as
+	// vnetIp=…, the host process (e.g. v2rayNG via VpnService.Builder)
+	// has already configured the TUN with that address before xray
+	// ever sees the file descriptor. Honour the same source of truth
+	// here: refuse to bring the tunnel up if the server announces a
+	// different address, since silently using two different IPs would
+	// look like working VPN with all packets dropped on the server's
+	// anti-spoofing check.
+	if c.cfg.AssignedIP.IsValid() && c.cfg.AssignedIP != ip {
+		return fmt.Errorf("l3client: server announced %s but link declares vnetIp=%s; ask the panel admin to regenerate the VLESS link so the IPs match", ip, c.cfg.AssignedIP)
 	}
 
 	// The device layer uses serverIP to install a /32 host-route

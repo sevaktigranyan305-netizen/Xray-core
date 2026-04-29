@@ -74,6 +74,56 @@ func TestOutboundDetour_TopLevelVirtualNetwork_Vless(t *testing.T) {
 	}
 }
 
+// TestOutboundDetour_TopLevelVirtualNetwork_VnetIp verifies that the
+// optional "vnetIp" field — used to anchor the TUN address against the
+// panel's pre-allocation when v2rayNG/v2rayN cannot let xray pick the
+// IP itself — is parsed both when written under "virtualNetwork" at
+// the outbound top level and propagates onto outbound.VirtualNetwork.
+// The JSON name is "vnetIp" (matching the VLESS link query parameter)
+// rather than "assignedIp" so the parsers on both sides stay in sync
+// without a translation table.
+func TestOutboundDetour_TopLevelVirtualNetwork_VnetIp(t *testing.T) {
+	raw := []byte(`{
+		"protocol": "vless",
+		"settings": {
+			"vnext": [{
+				"address": "109.172.115.130",
+				"port": 443,
+				"users": [{
+					"id": "62cd80bf-c4be-401b-a1c9-8fb4deca8e53",
+					"encryption": "none"
+				}]
+			}]
+		},
+		"virtualNetwork": {
+			"enabled": true,
+			"subnet": "10.0.0.0/24",
+			"defaultRoute": true,
+			"vnetIp": "10.0.0.7"
+		}
+	}`)
+
+	var cfg OutboundDetourConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal OutboundDetourConfig: %v", err)
+	}
+	handler, err := cfg.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	msg, err := handler.ProxySettings.GetInstance()
+	if err != nil {
+		t.Fatalf("GetInstance: %v", err)
+	}
+	out := msg.(*outbound.Config)
+	if out.VirtualNetwork == nil {
+		t.Fatal("outbound.Config.VirtualNetwork is nil")
+	}
+	if got, want := out.VirtualNetwork.AssignedIp, "10.0.0.7"; got != want {
+		t.Errorf("VirtualNetwork.AssignedIp = %q, want %q", got, want)
+	}
+}
+
 // TestOutboundDetour_InsideSettingsVirtualNetwork_Vless verifies the
 // existing inside-"settings" location still works and isn't broken
 // by the splice.
