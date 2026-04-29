@@ -43,8 +43,7 @@ Add the `virtualNetwork` block to your VLESS inbound:
         "decryption": "none",
         "virtualNetwork": {
           "enabled": true,
-          "subnet": "10.0.0.0/24",
-          "persistMapping": true
+          "subnet": "10.0.0.0/24"
         }
       },
       "streamSettings": { /* REALITY / XHTTP / etc. — unchanged */ }
@@ -57,7 +56,8 @@ Add the `virtualNetwork` block to your VLESS inbound:
 |---|---|---|
 | `enabled` | `false` | Master switch. When `false` the inbound behaves exactly like upstream VLESS. |
 | `subnet` | `10.0.0.0/24` | IPv4 subnet handed out by the IPAM. The first usable address is the gateway. |
-| `persistMapping` | `true` | Persist `UUID → virtual IP` mappings across restarts so the same client always gets the same IP. |
+
+IP allocation is sequential and stable. The first user gets `10.0.0.2`, the second `10.0.0.3`, and so on — the lowest free address above the gateway is always picked. The mapping `UUID → IP` is persisted to disk (`<asset-dir>/virtualnet-ipam-<subnet>.json`) so a returning client always reconnects on the same address, even across xray restarts. When a client is removed from the inbound (panel deletion, or the client UUID disappears from `clients[]` while xray is offline) their slot is released and reclaimed by the next new user.
 
 The gateway IP (e.g. `10.0.0.1` for `10.0.0.0/24`) is reserved by the gVisor netstack. Connections to the gateway IP are rewritten to `127.0.0.1` on the host so they reach services bound on `0.0.0.0` or loopback. Connections to other addresses inside the subnet are matched against the IPAM and forwarded into the owning client's stream (peer-to-peer); connections to addresses outside the subnet are dispatched through the normal Xray outbound chain (routing rules, freedom, blackhole, …).
 

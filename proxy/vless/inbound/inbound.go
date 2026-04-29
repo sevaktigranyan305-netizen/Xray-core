@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"io"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/retry"
 	"github.com/xtls/xray-core/common/serial"
@@ -195,7 +198,7 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 	}
 
 	if vn := config.GetVirtualNetwork(); vn.GetEnabled() {
-		if err := handler.initVirtualNetwork(vn); err != nil {
+		if err := handler.initVirtualNetwork(vn, config.Clients); err != nil {
 			return nil, errors.New("failed to init virtualNetwork").Base(err).AtError()
 		}
 	}
@@ -208,7 +211,15 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 // stack; TCP/UDP flows terminated by that stack are forwarded to
 // handler.defaultDispatcher with the originating user's virtual IP as
 // the inbound source so that xray routing rules can key on sourceIP.
-func (h *Handler) initVirtualNetwork(cfg *VirtualNetwork) error {
+//
+// The IPAM table is mirrored to disk so a UUID keeps the same virtual
+// IP across xray restarts. The on-disk path is derived from the asset
+// dir and subnet so multiple inbounds with different subnets do not
+// collide. After loading the persisted state we reconcile against the
+// inbound's current client list — any UUID that is no longer in the
+// config (i.e. the panel deleted the user while xray was offline) has
+// its mapping released, freeing the slot for the next new client.
+func (h *Handler) initVirtualNetwork(cfg *VirtualNetwork, clients []*protocol.User) error {
 	subnetStr := cfg.GetSubnet()
 	if subnetStr == "" {
 		// Default matches the task's example config.
@@ -220,15 +231,76 @@ func (h *Handler) initVirtualNetwork(cfg *VirtualNetwork) error {
 	}
 
 	sw, err := virtualnet.NewSwitch(h.ctx, virtualnet.Config{
-		Subnet:         prefix,
-		PersistMapping: cfg.GetPersistMapping(),
-		Handler:        h.virtualNetworkConnHandler(),
+		Subnet:      prefix,
+		PersistPath: virtualnetPersistPath(prefix),
+		Handler:     h.virtualNetworkConnHandler(),
 	})
 	if err != nil {
 		return err
 	}
 	h.vnet = sw
+
+	ipam := sw.IPAM()
+	loaded, skipped, lerr := ipam.LoadPersisted()
+	if lerr != nil {
+		errors.LogWarning(h.ctx, "virtualNetwork: load persisted IPAM: "+lerr.Error())
+	}
+	if loaded > 0 || skipped > 0 {
+		errors.LogInfo(h.ctx, "virtualNetwork: loaded "+strconv.Itoa(loaded)+" persisted IPAM mappings ("+strconv.Itoa(skipped)+" skipped)")
+	}
+
+	// Reconcile the loaded table against the current client list:
+	// drop any UUID -> IP mapping whose UUID has since been removed
+	// from the panel. This is the "user deleted while xray was
+	// offline" path; the runtime add/remove path is handled by the
+	// validator OnDel hook below.
+	activeUUIDs := make([]string, 0, len(clients))
+	for _, u := range clients {
+		acc, perr := u.GetTypedAccount()
+		if perr != nil {
+			continue
+		}
+		va, ok := acc.(*vless.MemoryAccount)
+		if !ok {
+			continue
+		}
+		activeUUIDs = append(activeUUIDs, va.ID.String())
+	}
+	if released := ipam.Reconcile(activeUUIDs); released > 0 {
+		errors.LogInfo(h.ctx, "virtualNetwork: released "+strconv.Itoa(released)+" stale IPAM mappings (clients deleted while xray was offline)")
+	}
+
+	// Wire the runtime delete hook: when the panel calls
+	// proxyman.AlterInbound with RemoveUserOperation, MemoryValidator.Del
+	// fires this callback with the deleted user, and we release their
+	// pinned IP back into the pool so the next new user can claim it.
+	if mv, ok := h.validator.(*vless.MemoryValidator); ok {
+		mv.SetOnDel(func(mu *protocol.MemoryUser) {
+			va, ok := mu.Account.(*vless.MemoryAccount)
+			if !ok {
+				return
+			}
+			ipam.Release(va.ID.String())
+		})
+	}
 	return nil
+}
+
+// virtualnetPersistPath derives the on-disk path used to persist the
+// IPAM table for the given subnet. We embed a sanitised subnet string
+// in the filename so multiple inbounds with different subnets do not
+// collide on the same file.
+func virtualnetPersistPath(prefix netip.Prefix) string {
+	assetDir := platform.NewEnvFlag(platform.AssetLocation).GetValue(func() string {
+		if exec, err := os.Executable(); err == nil {
+			return filepath.Dir(exec)
+		}
+		return "."
+	})
+	// Replace characters that are awkward in filenames on either
+	// POSIX or Windows. "10.0.0.0/24" -> "10.0.0.0_24".
+	slug := strings.ReplaceAll(prefix.String(), "/", "_")
+	return filepath.Join(assetDir, "virtualnet-ipam-"+slug+".json")
 }
 
 // virtualNetworkConnHandler builds the ConnHandler closure passed into
