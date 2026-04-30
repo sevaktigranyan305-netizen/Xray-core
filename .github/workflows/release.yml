@@ -19,15 +19,19 @@ jobs:
         # matches the convention sevaktigranyan305-netizen/3x-ui already
         # uses when it renames its extracted binary to xray-<os>-<arch>.
         # `goarm` is only set for 32-bit ARM variants.
+        #
+        # Matrix is intentionally trimmed for this fork: only the platforms
+        # we actually deploy or develop on. Dropped relative to upstream:
+        # linux-armv5/armv6 (legacy SBCs / old routers), linux-s390x (IBM
+        # mainframes), and BSD/illumos/plan9/riscv64/mips* targets that
+        # would just lengthen release builds with no consumer.
+        # release-win7.yml separately covers the patched Windows 7 build.
         include:
           - { goos: linux,   goarch: amd64,           name: linux-amd64 }
-          - { goos: linux,   goarch: '386',           name: linux-386 }
           - { goos: linux,   goarch: arm64,           name: linux-arm64 }
           - { goos: linux,   goarch: arm,   goarm: 7, name: linux-armv7 }
-          - { goos: linux,   goarch: arm,   goarm: 6, name: linux-armv6 }
-          - { goos: linux,   goarch: arm,   goarm: 5, name: linux-armv5 }
-          - { goos: linux,   goarch: s390x,           name: linux-s390x }
           - { goos: windows, goarch: amd64,           name: windows-amd64 }
+          - { goos: windows, goarch: '386',           name: windows-386 }
           - { goos: darwin,  goarch: amd64,           name: darwin-amd64 }
           - { goos: darwin,  goarch: arm64,           name: darwin-arm64 }
           - { goos: android, goarch: arm64,           name: android-arm64 }
