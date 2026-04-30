@@ -12,7 +12,7 @@ This is a soft fork of [XTLS/Xray-core](https://github.com/XTLS/Xray-core) that 
 |---|---|---|
 | VLESS as a stream proxy (TCP / UDP per connection) | ✓ | ✓ |
 | Per-client virtual IPv4 inside a subnet | — | ✓ |
-| Kernel TUN interface on the client (Linux / Darwin) | — | ✓ |
+| Kernel TUN interface on the client (Linux / Darwin / Android) | — | ✓ |
 | `ping` / ICMP across the tunnel | — | ✓ |
 | Peer-to-peer between connected clients (10.0.0.x ↔ 10.0.0.y) | — | ✓ |
 | Reach VPS host services via the gateway IP (`curl http://10.0.0.1:port`) | — | ✓ |
@@ -22,7 +22,7 @@ The user-visible config is a single optional `virtualNetwork` block on the VLESS
 
 ## How it works (one-paragraph version)
 
-When a client connects, it sends an extended VLESS request carrying the user's UUID. The server's IPAM assigns or recalls a virtual IPv4 from the configured subnet for that UUID, replies with a 4-byte preamble carrying `(assigned_ip, gateway_ip, prefix_len)`, and from then on both sides exchange raw IPv4 packets over the same VLESS stream using a 2-byte length prefix. Server-side, packets enter a [gVisor](https://github.com/google/gvisor) userspace netstack: TCP/UDP destined to peer addresses is forwarded directly between client streams, and TCP/UDP destined to the gateway is rewritten to loopback and dispatched through the normal Xray outbound chain (so routing rules, freedom, blackhole, `domain:` rules, etc. all keep working). Client-side, on Linux and macOS the outbound creates a kernel TUN interface (`xray0` by default), assigns the virtual IP, and bridges it 1:1 with the framed VLESS stream.
+When a client connects, it sends an extended VLESS request carrying the user's UUID. The server's IPAM assigns or recalls a virtual IPv4 from the configured subnet for that UUID, replies with a 4-byte preamble carrying `(assigned_ip, gateway_ip, prefix_len)`, and from then on both sides exchange raw IPv4 packets over the same VLESS stream using a 2-byte length prefix. Server-side, packets enter a [gVisor](https://github.com/google/gvisor) userspace netstack: TCP/UDP destined to peer addresses is forwarded directly between client streams, and TCP/UDP destined to the gateway is rewritten to loopback and dispatched through the normal Xray outbound chain (so routing rules, freedom, blackhole, `domain:` rules, etc. all keep working). Client-side, on Linux and macOS the outbound creates a kernel TUN interface (`xray0` by default), assigns the virtual IP, and bridges it 1:1 with the framed VLESS stream. On Android, the host application (e.g. v2rayNG) creates the TUN through `VpnService.Builder` and passes the file descriptor to xray-core, which adopts it transparently.
 
 ## Server-side example
 
@@ -85,7 +85,8 @@ The client outbound creates a kernel TUN device. **You need root** (or `cap_net_
           "subnet":        "10.0.0.0/24",
           "interfaceName": "xray0",
           "mtu":           1420,
-          "defaultRoute":  true
+          "defaultRoute":  true,
+          "vnetIp":        "10.0.0.2"
         }
       },
       "streamSettings": { /* REALITY / XHTTP / etc. */ }
@@ -101,6 +102,7 @@ The client outbound creates a kernel TUN device. **You need root** (or `cap_net_
 | `interfaceName` | `xray0` | Name of the kernel TUN device created on the host. |
 | `mtu` | `1420` | TUN MTU. The default leaves headroom for the VLESS / TLS / IP layers below. |
 | `defaultRoute` | `true` | When `true`, the outbound rewrites the host's default route through the TUN, i.e. **all** traffic goes through the tunnel. Set to `false` for split-tunnel — only the subnet is routed through the TUN, the rest of the host's traffic stays on its existing default route. |
+| `vnetIp` | *(unset)* | Optional. The virtual IPv4 the panel pre-allocated for this user (e.g. `"10.0.0.2"`). When set, the client validates the server's preamble against this address and refuses to bring the tunnel up if they disagree — the error message tells the operator to regenerate the VLESS link. Required on Android because `VpnService.Builder` locks the TUN address before xray sees the file descriptor; optional on Linux / macOS where xray opens its own TUN and can use whatever the server announces. |
 
 After `xray run`, the host should have:
 
@@ -117,18 +119,19 @@ $ curl https://example.com     # only when defaultRoute=true
 
 ## `vless://` link extensions
 
-The fork's `vless://` URI parser recognises three extra query parameters so a single share-link can carry the VPN config:
+The fork's `vless://` URI parser recognises four extra query parameters so a single share-link can carry the VPN config:
 
 | Param | Meaning |
 |---|---|
 | `vnet=1` | Enable `virtualNetwork` on the outbound. |
 | `vnetSubnet=10.0.0.0/24` | Override `subnet`. URL-encode the slash as `%2F`. |
 | `vnetDefaultRoute=1` / `vnetDefaultRoute=0` | Override `defaultRoute`. |
+| `vnetIp=10.0.0.2` | Pre-allocated virtual IP. Maps to `virtualNetwork.vnetIp` in the outbound config. |
 
 A complete share link looks like:
 
 ```
-vless://<uuid>@vps.example.com:443?type=tcp&security=reality&pbk=...&fp=chrome&sni=...&sid=...&spx=%2F&vnet=1&vnetSubnet=10.0.0.0%2F24&vnetDefaultRoute=1#vps
+vless://<uuid>@vps.example.com:443?type=tcp&security=reality&pbk=...&fp=chrome&sni=...&sid=...&spx=%2F&vnet=1&vnetSubnet=10.0.0.0%2F24&vnetDefaultRoute=1&vnetIp=10.0.0.2#vps
 ```
 
 Clients that don't understand the new params silently ignore them and behave as a stock VLESS proxy.
@@ -167,7 +170,7 @@ Pre-built binaries for every test tag are attached to each [release](https://git
 ## Compatibility & limitations
 
 - **Server platforms:** any platform Xray-core itself supports — the server side is gVisor-only and never touches the kernel.
-- **Client platforms:** kernel TUN works on Linux and macOS (Darwin). Windows / Android / iOS clients can still connect, but currently bring up the TUN through their own platform glue (e.g. the platform's VPN service for Android) — refer to your client's documentation.
+- **Client platforms:** kernel TUN works on Linux, macOS (Darwin), and **Android**. On Android the host application (e.g. v2rayNG) creates a TUN through `VpnService.Builder` and passes the file descriptor to xray-core via the `xray.tun.fd` environment variable; xray-core adopts it and drives packet I/O without requiring `CAP_NET_ADMIN`. Windows / iOS clients can still connect, but currently bring up the TUN through their own platform glue — refer to your client's documentation.
 - **IPv6:** the virtual subnet is IPv4-only. The underlying VLESS transport (the TLS / REALITY / XHTTP layer) can run on either v4 or v6.
 - **NAT / port-forwarding from the public internet to a peer:** out of scope. Peers can talk to each other and to the server's host; they're not reachable from the public internet unless you publish them yourself.
 - **`vless://` URI extensions** (`vnet`, `vnetSubnet`, `vnetDefaultRoute`) are a fork-local convention; share-links generated here are still valid stock VLESS links for clients that don't support the VPN mode.
