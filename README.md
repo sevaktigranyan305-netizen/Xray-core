@@ -1,8 +1,19 @@
-# Xray-core (VLESS L3 / VPN fork)
+# Xray-core (VLESS L3 / VPN fork, v2rayVN stack)
 
 [English](./README.md) · [Русский](./README.ru.md)
 
 This is a soft fork of [XTLS/Xray-core](https://github.com/XTLS/Xray-core) that turns the VLESS protocol from a stream proxy into a real Layer-3 VPN. Connected clients get a virtual IP inside a configurable subnet, can address the server's host services through the gateway IP, and can reach each other peer-to-peer. The fork keeps the rest of Xray-core (REALITY, XHTTP, XUDP, routing, sniffing, balancers, etc.) byte-compatible with upstream — you can run a stock VLESS-REALITY setup on this build with no behavioural change.
+
+This repo is the **server / core** side of the v2rayVN fork stack. For a companion admin panel and mobile client that speak the same L3 protocol, see the table below.
+
+## The v2rayVN fork stack
+
+| Component | Role | Repository |
+|---|---|---|
+| **Xray-core (fork)** | Server / core with L3 virtualnet (VLESS-as-VPN) | *this repo* |
+| **3x-ui (fork)** | Admin panel with per-client virtual-IP (`vnetIp`) IPAM | https://github.com/sevaktigranyan305-netizen/3x-ui |
+| **AndroidLibXrayLite (fork)** | gomobile bindings producing `libv2ray.aar` | https://github.com/sevaktigranyan305-netizen/AndroidLibXrayLite |
+| **v2rayVN (Android client)** | Android VPN app built on top of `libv2ray.aar` | https://github.com/sevaktigranyan305-netizen/v2rayNG |
 
 > **Status: testing.** Releases are tagged `v0.0.x-test` while the protocol additions and the wire format are stabilised. It is safe to deploy alongside non-VPN VLESS clients on the same inbound, but please don't pin production users to a specific test release yet.
 
@@ -170,10 +181,23 @@ Pre-built binaries for every test tag are attached to each [release](https://git
 ## Compatibility & limitations
 
 - **Server platforms:** any platform Xray-core itself supports — the server side is gVisor-only and never touches the kernel.
-- **Client platforms:** kernel TUN works on Linux, macOS (Darwin), and **Android**. On Android the host application (e.g. v2rayNG) creates a TUN through `VpnService.Builder` and passes the file descriptor to xray-core via the `xray.tun.fd` environment variable; xray-core adopts it and drives packet I/O without requiring `CAP_NET_ADMIN`. Windows / iOS clients can still connect, but currently bring up the TUN through their own platform glue — refer to your client's documentation.
+- **Client platforms:** kernel TUN works on Linux, macOS (Darwin), and **Android**. On Android the host application (e.g. [v2rayVN](https://github.com/sevaktigranyan305-netizen/v2rayNG)) creates a TUN through `VpnService.Builder` and passes the file descriptor to xray-core via the `xray.tun.fd` environment variable; xray-core adopts it and drives packet I/O without requiring `CAP_NET_ADMIN`. Windows / iOS clients can still connect, but currently bring up the TUN through their own platform glue — refer to your client's documentation.
 - **IPv6:** the virtual subnet is IPv4-only. The underlying VLESS transport (the TLS / REALITY / XHTTP layer) can run on either v4 or v6.
 - **NAT / port-forwarding from the public internet to a peer:** out of scope. Peers can talk to each other and to the server's host; they're not reachable from the public internet unless you publish them yourself.
-- **`vless://` URI extensions** (`vnet`, `vnetSubnet`, `vnetDefaultRoute`) are a fork-local convention; share-links generated here are still valid stock VLESS links for clients that don't support the VPN mode.
+- **`vless://` URI extensions** (`vnet`, `vnetSubnet`, `vnetDefaultRoute`, `vnetIp`) are a fork-local convention; share-links generated here are still valid stock VLESS links for clients that don't support the VPN mode.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Client connects but gets no virtual IP (stays stuck on the VLESS handshake) | Inbound was built with upstream Xray-core, client with this fork (or vice versa). Preamble byte is rejected. | Use this fork on both ends. If you only control the client, set `virtualNetwork.enabled=false` — the client then falls back to plain VLESS. |
+| Client's `assignedIp` in xray logs does not match the `vnetIp=` the panel generated | The panel regenerated the share-link after the client's UUID was removed from the inbound and re-added. IPAM reassigned a new IP. | Regenerate the share-link from the panel — the QR carries the current `vnetIp`. |
+| `ping 10.0.0.1` (gateway) times out from the client | Loopback-ICMP blocked on the server's kernel. | `iptables -I INPUT -i lo -p icmp -j ACCEPT` on the server. |
+| Peer-to-peer traffic (`ping 10.0.0.N` from client A to client B) times out | Either client B is not currently connected, or the inbound is behind a load balancer that pins A and B to different xray processes. | Verify both clients are connected (`x-ui log` on the panel, or `xray api stats`). Use a single xray process per inbound if running behind a load balancer. |
+| Routing rules (`{"inboundTag": [...], "domain": ["geosite:cn"], "outboundTag": "direct"}`) ignored for tunnel traffic | Inbound tag not reaching L3 sub-flows. | Update to the latest fork release — `inbound.Tag` is propagated to L3 sub-flows since `v0.0.8-test`. |
+| Android client: TUN comes up but `defaultRoute: true` doesn't push all traffic into the tunnel | `VpnService.Builder.addRoute("0.0.0.0", 0)` call was missing. | Update v2rayVN — recent versions always add `0.0.0.0/0` when `vnetDefaultRoute=1` in the QR. |
+
+For issues specific to the panel (share-link generation, IPAM assignments, panel UI), see the [3x-ui fork README](https://github.com/sevaktigranyan305-netizen/3x-ui#readme). For issues specific to the Android client, see the [v2rayVN README](https://github.com/sevaktigranyan305-netizen/v2rayNG#readme).
 
 ## Credits
 
