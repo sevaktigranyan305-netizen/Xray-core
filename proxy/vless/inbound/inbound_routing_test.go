@@ -10,7 +10,10 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy/vless"
@@ -345,6 +348,123 @@ func TestInboundTagAtomicStoreLoad(t *testing.T) {
 	got := p.Load()
 	if got == nil || *got != "inbound-443" {
 		t.Fatalf("Load after Store mismatch: %v", got)
+	}
+}
+
+// TestVirtualNetworkConnHandlerAttachesUser pins the contract that
+// L3 sub-flows surface with session.Inbound.User pointing at the
+// MemoryUser whose UUID was assigned to the source virtual IP. This
+// is what binds traffic counters in the dispatcher (which keys on
+// inbound.User.Email to register "user>>>email>>>traffic>>>uplink"
+// and "...>>>downlink" stat counters) so that bytes carried by an
+// L3 tunnel are attributed to the same client quota in 3x-ui as
+// classic VLESS proxy traffic. Without this binding, virtualnet
+// traffic would silently bypass per-user accounting and 3x-ui would
+// report zero-byte usage despite a working tunnel.
+func TestVirtualNetworkConnHandlerAttachesUser(t *testing.T) {
+	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
+		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("NewSwitch: %v", err)
+	}
+	defer sw.Close()
+
+	userUUID := uuid.New()
+	userPB := &protocol.User{
+		Email:   "alice@example.com",
+		Account: serial.ToTypedMessage(&vless.Account{Id: userUUID.String()}),
+	}
+	memUser, err := userPB.ToMemoryUser()
+	if err != nil {
+		t.Fatalf("ToMemoryUser: %v", err)
+	}
+	validator := new(vless.MemoryValidator)
+	if err := validator.Add(memUser); err != nil {
+		t.Fatalf("validator.Add: %v", err)
+	}
+
+	// Pre-assign the UUID to a virtual IP via IPAM, mirroring what
+	// serveVirtualNetwork does on a real VLESS handshake.
+	assignedIP, err := sw.IPAM().Assign(userUUID.String())
+	if err != nil {
+		t.Fatalf("IPAM.Assign: %v", err)
+	}
+
+	disp := &captureDispatcher{}
+	h := &Handler{
+		defaultDispatcher: disp,
+		validator:         validator,
+		vnet:              sw,
+		ctx:               xrayCtxForTest(t),
+	}
+
+	dst := net.Destination{
+		Network: net.Network_TCP,
+		Address: net.ParseAddress("8.8.8.8"),
+		Port:    net.Port(443),
+	}
+	conn := newFakeConn("8.8.8.8", 443)
+	h.virtualNetworkConnHandler()(assignedIP, dst, conn)
+
+	if got := len(disp.inbounds); got != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", got)
+	}
+	in := disp.inbounds[0]
+	if in == nil {
+		t.Fatalf("session.Inbound missing on dispatched ctx")
+	}
+	if in.User == nil {
+		t.Fatalf("inbound.User is nil; traffic accounting will not bind " +
+			"to user>>>email>>>traffic counters in dispatcher")
+	}
+	if got, want := in.User.Email, "alice@example.com"; got != want {
+		t.Errorf("inbound.User.Email = %q, want %q", got, want)
+	}
+}
+
+// TestVirtualNetworkConnHandlerLeavesUserNilWhenIPUnassigned pins the
+// fail-safe path: if the source virtual IP has no IPAM mapping (which
+// should never happen for a healthy tunnel, but can happen briefly
+// during teardown or if a packet arrives before Register fires), the
+// handler must NOT panic and must dispatch with inbound.User=nil so
+// the dispatcher silently skips user-stat wrapping rather than
+// crashing the goroutine.
+func TestVirtualNetworkConnHandlerLeavesUserNilWhenIPUnassigned(t *testing.T) {
+	sw, err := virtualnet.NewSwitch(context.Background(), virtualnet.Config{
+		Subnet: netip.MustParsePrefix("10.0.0.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("NewSwitch: %v", err)
+	}
+	defer sw.Close()
+
+	disp := &captureDispatcher{}
+	h := &Handler{
+		defaultDispatcher: disp,
+		validator:         new(vless.MemoryValidator),
+		vnet:              sw,
+		ctx:               xrayCtxForTest(t),
+	}
+
+	src := netip.MustParseAddr("10.0.0.123") // never Assign-ed
+	dst := net.Destination{
+		Network: net.Network_TCP,
+		Address: net.ParseAddress("8.8.8.8"),
+		Port:    net.Port(443),
+	}
+	conn := newFakeConn("8.8.8.8", 443)
+	h.virtualNetworkConnHandler()(src, dst, conn)
+
+	if got := len(disp.inbounds); got != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", got)
+	}
+	in := disp.inbounds[0]
+	if in == nil {
+		t.Fatalf("session.Inbound missing on dispatched ctx")
+	}
+	if in.User != nil {
+		t.Errorf("inbound.User = %+v, want nil for unassigned source IP", in.User)
 	}
 }
 
