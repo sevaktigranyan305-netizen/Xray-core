@@ -91,12 +91,33 @@ jobs:
             go build -v -trimpath -ldflags "-s -w -buildid=" -o dist/xray ./main
           fi
 
+      # Bundle wintun.dll alongside xray.exe so the L3 virtualnet client
+      # backend (proxy/vless/l3client/device_windows.go) can load wintun
+      # at runtime. Wintun searches the executable's directory before
+      # PATH, so dropping the DLL next to xray.exe is enough — no
+      # registry tweaks, no installer required. The official zip is
+      # signed by WireGuard LLC; we pick the per-arch DLL out of it.
+      - name: Bundle wintun.dll (windows only)
+        if: matrix.goos == 'windows'
+        run: |
+          set -euo pipefail
+          curl -fL https://www.wintun.net/builds/wintun-0.14.1.zip -o /tmp/wintun.zip
+          mkdir -p /tmp/wintun
+          unzip -q /tmp/wintun.zip -d /tmp/wintun
+          case "${{ matrix.goarch }}" in
+            amd64) cp /tmp/wintun/wintun/bin/amd64/wintun.dll dist/wintun.dll ;;
+            '386') cp /tmp/wintun/wintun/bin/x86/wintun.dll   dist/wintun.dll ;;
+            arm64) cp /tmp/wintun/wintun/bin/arm64/wintun.dll dist/wintun.dll ;;
+            arm)   cp /tmp/wintun/wintun/bin/arm/wintun.dll   dist/wintun.dll ;;
+            *)     echo "unsupported windows arch ${{ matrix.goarch }}" >&2; exit 1 ;;
+          esac
+
       - name: Package zip
         run: |
           cd dist
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            zip -j "xray-${{ matrix.name }}.zip" xray.exe
-            rm xray.exe
+            zip -j "xray-${{ matrix.name }}.zip" xray.exe wintun.dll
+            rm xray.exe wintun.dll
           else
             zip -j "xray-${{ matrix.name }}.zip" xray
             rm xray
